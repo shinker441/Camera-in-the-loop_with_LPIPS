@@ -32,6 +32,7 @@ import torch
 import numpy as np
 import configargparse
 import lpips
+from skimage.metrics import peak_signal_noise_ratio as psnr_skimage
 
 from propagation_ASM import propagation_ASM
 from utils.augmented_image_loader import ImageLoader
@@ -134,6 +135,7 @@ image_loader = ImageLoader(data_path, channel=channel if channel < 3 else None,
 # Metric accumulators
 lpips_vals = {'amp': [], 'lin': [], 'srgb': []}
 ssims      = {'amp': [], 'lin': [], 'srgb': []}
+psnrs      = {'amp': [], 'lin': [], 'srgb': []}
 idxs = []
 
 # ---------------------------------------------------------------------------
@@ -192,11 +194,25 @@ for k, target in enumerate(image_loader):
         multichannel=(channel == 3)
     )
 
+    # Compute PSNR across three domains
+    target_linear = target_np ** 2
+    recon_linear  = recon_np  ** 2
+    target_srgb   = utils.srgb_lin2gamma(np.clip(target_linear, 0.0, 1.0))
+    recon_srgb    = utils.srgb_lin2gamma(np.clip(recon_linear,  0.0, 1.0))
+    psnr_val = {
+        'amp':  psnr_skimage(target_np,     recon_np,     data_range=1.0),
+        'lin':  psnr_skimage(target_linear, recon_linear, data_range=1.0),
+        'srgb': psnr_skimage(target_srgb,   recon_srgb,   data_range=1.0),
+    }
+
     idxs.append(target_idx)
     for domain in ['amp', 'lin', 'srgb']:
         lpips_vals[domain].append(lpips_val[domain])
         ssims[domain].append(ssim_val[domain])
-        print(f'  LPIPS({domain}): {lpips_val[domain]:.4f}  SSIM({domain}): {ssim_val[domain]:.4f}')
+        psnrs[domain].append(psnr_val[domain])
+        print(f'  LPIPS({domain}): {lpips_val[domain]:.4f}  '
+              f'SSIM({domain}): {ssim_val[domain]:.4f}  '
+              f'PSNR({domain}): {psnr_val[domain]:.2f} dB')
 
     # Save reconstructed sRGB image
     recon_srgb = utils.srgb_lin2gamma(np.clip(recon_np ** 2, 0.0, 1.0))
@@ -211,8 +227,9 @@ for k, target in enumerate(image_loader):
 # ---------------------------------------------------------------------------
 data_dict = {'img_idx': idxs}
 for domain in ['amp', 'lin', 'srgb']:
-    data_dict[f'ssims_{domain}']      = ssims[domain]
-    data_dict[f'lpips_{domain}']      = lpips_vals[domain]
+    data_dict[f'ssims_{domain}']  = ssims[domain]
+    data_dict[f'lpips_{domain}']  = lpips_vals[domain]
+    data_dict[f'psnrs_{domain}']  = psnrs[domain]
 
 sio.savemat(
     os.path.join(recon_path, f'metrics_{run_id}_{chan_strs[channel]}.mat'),
@@ -220,5 +237,6 @@ sio.savemat(
 )
 
 print(f'\n  Results saved to {recon_path}')
-print(f'  Mean LPIPS (sRGB, lower=better): {np.mean(lpips_vals["srgb"]):.4f}')
+print(f'  Mean LPIPS (sRGB, lower=better):  {np.mean(lpips_vals["srgb"]):.4f}')
 print(f'  Mean SSIM  (sRGB, higher=better): {np.mean(ssims["srgb"]):.4f}')
+print(f'  Mean PSNR  (sRGB, higher=better): {np.mean(psnrs["srgb"]):.2f} dB')

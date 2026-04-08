@@ -1,8 +1,8 @@
 """
-Neural Holography - CITL with LPIPS:
+Neural Holography - CITL with MSE + LPIPS:
 
-Utility functions. Modified from the original neural-holography repository to replace
-PSNR with LPIPS (Learned Perceptual Image Patch Similarity) as the evaluation metric.
+Utility functions. Modified from the original neural-holography repository to use
+MSE + λ × LPIPS as the combined optimisation loss, and LPIPS/SSIM/PSNR as evaluation metrics.
 
 Original paper:
 Y. Peng, S. Choi, N. Padmanaban, G. Wetzstein. Neural Holography with Camera-in-the-loop Training.
@@ -28,36 +28,62 @@ from skimage.metrics import structural_similarity as ssim
 
 
 # ---------------------------------------------------------------------------
-# LPIPS helpers
+# Combined loss: MSE + λ × LPIPS
 # ---------------------------------------------------------------------------
 
-class LPIPSLoss(nn.Module):
-    """Perceptual loss using LPIPS — drop-in replacement for nn.MSELoss().
+class CombinedLoss(nn.Module):
+    """Combined MSE + λ × LPIPS loss for hologram phase optimisation.
+
+    MSE provides stable pixel-level gradients that guarantee convergence.
+    LPIPS guides the optimisation toward perceptually better quality.
+    Setting lambda_lpips=0 recovers pure MSE (useful for ablation studies).
 
     Accepts amplitude tensors in [0, 1] range with shape (N, C, H, W).
-    Internally rescales to [-1, 1] and expands single-channel to 3-channel
-    before forwarding to the LPIPS network.
+    Single-channel inputs are repeated to 3 channels for LPIPS.
+    LPIPS network parameters are frozen (requires_grad=False).
+
+    After each forward() call, the component values are available as:
+        self.last_mse   — MSE term (detached scalar tensor)
+        self.last_lpips — LPIPS term (detached scalar tensor)
 
     Args:
-        net: backbone for LPIPS. 'vgg' recommended for use as a training loss;
-             'alex' is faster and recommended for evaluation only.
+        net:          LPIPS backbone. 'vgg' recommended for training loss;
+                      'alex' is faster and better for evaluation only.
+        lambda_lpips: Weight for the LPIPS term (default 0.1).
+                      Set to 0 for pure MSE.
     """
 
-    def __init__(self, net='vgg'):
+    def __init__(self, net='vgg', lambda_lpips=0.1):
         super().__init__()
-        self.lpips_fn = lpips.LPIPS(net=net)
+        self.lambda_lpips = lambda_lpips
+        self.mse_loss = nn.MSELoss()
+        self.lpips_net = lpips.LPIPS(net=net)
+        for param in self.lpips_net.parameters():
+            param.requires_grad = False
+        self.last_mse = None
+        self.last_lpips = None
 
-    def forward(self, recon, target):
-        r = self._prep(recon)
-        t = self._prep(target)
-        return self.lpips_fn(r, t).mean()
+    def forward(self, input, target):
+        mse_val = self.mse_loss(input, target)
+
+        if self.lambda_lpips > 0:
+            input_3ch = self._to_3ch(input)
+            target_3ch = self._to_3ch(target)
+            lpips_val = self.lpips_net(input_3ch, target_3ch).mean()
+        else:
+            lpips_val = torch.zeros(1, device=input.device)
+
+        self.last_mse = mse_val.detach()
+        self.last_lpips = lpips_val.detach()
+
+        return mse_val + self.lambda_lpips * lpips_val
 
     @staticmethod
-    def _prep(amp):
-        """Scale [0,1] → [-1,1] and expand to 3 channels."""
+    def _to_3ch(amp):
+        """Scale [0,1] → [-1,1] and repeat to 3 channels for LPIPS."""
         x = amp.clamp(0.0, 1.0) * 2.0 - 1.0
         if x.shape[1] == 1:
-            x = x.expand(-1, 3, -1, -1)
+            x = x.repeat(1, 3, 1, 1)
         return x
 
 

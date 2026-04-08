@@ -1,13 +1,13 @@
 """
-Neural Holography - CITL with LPIPS:
+Neural Holography - CITL with MSE + LPIPS:
 
 Training script for the parameterised wave propagation model with
 Camera-in-the-Loop (CITL).
 
 Modified from the original neural-holography repository:
-  - MSELoss for phase optimisation (loss_phase) replaced with LPIPSLoss.
-  - MSELoss for model training (loss_model) replaced with LPIPSLoss.
-  - TensorBoard summaries log LPIPS instead of PSNR.
+  - Combined MSE + λ × LPIPS loss used for phase optimisation (loss_phase).
+  - Combined MSE + λ × LPIPS loss used for model training (loss_model).
+  - TensorBoard summaries log MSE, LPIPS, and combined loss separately.
 
 Original paper:
 Y. Peng, S. Choi, N. Padmanaban, G. Wetzstein. Neural Holography with Camera-in-the-loop
@@ -63,6 +63,11 @@ p.add_argument('--step_lr', type=utils.str2bool, default=True,
 p.add_argument('--experiment', type=str, default='', help='Name of experiment.')
 p.add_argument('--lpips_net', type=str, default='vgg',
                help='LPIPS backbone for training losses: vgg (default) or alex.')
+p.add_argument('--lambda_lpips_model', type=float, default=0.05,
+               help='LPIPS weight for model training loss (MSE + λ × LPIPS). '
+                    'Smaller than lambda_lpips_phase to prioritise physical fidelity.')
+p.add_argument('--lambda_lpips_phase', type=float, default=0.1,
+               help='LPIPS weight for phase optimisation loss (MSE + λ × LPIPS).')
 
 opt = p.parse_args()
 
@@ -71,7 +76,8 @@ chan_str = ('red', 'green', 'blue')[channel]
 run_id = f'{chan_str}_{opt.experiment}_lr{opt.lr_model}_batchsize{opt.batch_size}'
 
 print(f'   - training parameterised wave propagation model...')
-print(f'   - loss functions: LPIPSLoss ({opt.lpips_net} backbone)')
+print(f'   - loss functions: MSE + λ × LPIPS ({opt.lpips_net} backbone)')
+print(f'     lambda_lpips_phase={opt.lambda_lpips_phase}, lambda_lpips_model={opt.lambda_lpips_model}')
 
 # ---------------------------------------------------------------------------
 # Physical / optical parameters
@@ -91,11 +97,15 @@ device       = torch.device('cuda')
 # ---------------------------------------------------------------------------
 lr_s_phase = opt.lr_phase / 200
 
-# LPIPSLoss for phase optimisation: comparing simulated amplitude vs target
-loss_phase = utils.LPIPSLoss(net=opt.lpips_net).to(device)
+# CombinedLoss for phase optimisation: simulated amplitude vs target
+# lambda_lpips_phase is larger — perceptual quality is the primary goal here
+loss_phase = utils.CombinedLoss(net=opt.lpips_net,
+                                 lambda_lpips=opt.lambda_lpips_phase).to(device)
 
-# LPIPSLoss for model training: comparing model output amplitude vs camera capture
-loss_model = utils.LPIPSLoss(net=opt.lpips_net).to(device)
+# CombinedLoss for model training: model output amplitude vs camera capture
+# lambda_lpips_model is smaller — physical fidelity to the camera takes priority
+loss_model = utils.CombinedLoss(net=opt.lpips_net,
+                                 lambda_lpips=opt.lambda_lpips_model).to(device)
 
 # MSELoss kept for reference reporting (camera vs target)
 loss_mse = nn.MSELoss().to(device)
@@ -273,8 +283,14 @@ for e in range(opt.num_epochs):
                 writer.add_scalar('Scale/sb', sb, i_acc)
                 for idx_s in range(opt.batch_size):
                     writer.add_scalar(f'Scale/model_vs_target_{idx_s}', scale_phase[idx_s], i_acc)
-                writer.add_scalar('Loss/phase_lpips', loss_value_phase, i_acc)
-                writer.add_scalar('Loss/model_lpips', loss_value_model, i_acc)
+                # Phase loss components
+                writer.add_scalar('Loss/phase_total',  loss_value_phase,       i_acc)
+                writer.add_scalar('Loss/phase_mse',    loss_phase.last_mse,    i_acc)
+                writer.add_scalar('Loss/phase_lpips',  loss_phase.last_lpips,  i_acc)
+                # Model loss components
+                writer.add_scalar('Loss/model_total',  loss_value_model,       i_acc)
+                writer.add_scalar('Loss/model_mse',    loss_model.last_mse,    i_acc)
+                writer.add_scalar('Loss/model_lpips',  loss_model.last_lpips,  i_acc)
                 # Reference MSE between camera and target (for monitoring)
                 writer.add_scalar(
                     'Loss/camera_vs_target_mse',

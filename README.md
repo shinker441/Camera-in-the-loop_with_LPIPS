@@ -1,6 +1,6 @@
-# Camera-in-the-Loop with LPIPS
+# Camera-in-the-Loop with MSE + LPIPS
 
-Neural Holography の Camera-in-the-Loop (CITL) 実装を、評価指標および最適化損失を **PSNR → LPIPS (Learned Perceptual Image Patch Similarity)** に置き換えたコードです。
+Neural Holography の Camera-in-the-Loop (CITL) 実装を、最適化損失に **MSE + λ × LPIPS** の併用方式を採用し、評価指標に **LPIPS / SSIM / PSNR** を用いるように改修したコードです。
 
 元論文: [Neural Holography with Camera-in-the-loop Training (Peng et al., SIGGRAPH Asia 2020)](https://github.com/computational-imaging/neural-holography)
 
@@ -26,9 +26,20 @@ Neural Holography の Camera-in-the-Loop (CITL) 実装を、評価指標およ�
 
 このリポジトリは以下を行います：
 
-- **SGD による位相最適化**：MSE損失の代わりに LPIPS を用いて、知覚的品質を最大化した位相パターンを生成します。
-- **CITL 伝播モデル学習**：実カメラ撮影画像と SLM 表示画像の LPIPS 距離を最小化するよう、波面伝播モデルを学習します。
-- **評価**：振幅 (amp) / 線形強度 (lin) / sRGB の3ドメインで LPIPS と SSIM を計算します。
+- **SGD による位相最適化**：`MSE + λ × LPIPS` の併用損失を用いて、安定した収束と知覚的品質向上を両立した位相パターンを生成します。
+- **CITL 伝播モデル学習**：実カメラ撮影画像と SLM 表示画像の `MSE + λ × LPIPS` 距離を最小化するよう、波面伝播モデルを学習します。
+- **評価**：振幅 (amp) / 線形強度 (lin) / sRGB の3ドメインで LPIPS・SSIM・PSNR を計算します。
+
+### 損失関数の設計方針
+
+MSEは最適化の安定的な収束を保証する土台として残し、LPIPSは知覚的品質向上の方向付けとして併用します。
+
+| 役割 | 損失 | 理由 |
+|------|------|------|
+| 収束の安定 | MSE | ピクセル単位の勾配を安定供給し、発散を防ぐ |
+| 知覚品質の向上 | λ × LPIPS | 人間の知覚に近い方向へ最適化を誘導する |
+
+LPIPS 単独使用はほぼなく、画像生成・超解像の分野でも MSE + LPIPS の併用が標準的です。
 
 > **注意**: このリポジトリは元の neural-holography リポジトリの変更ファイルのみを含みます。動作させるには元リポジトリのファイルと合わせて使用してください（[セットアップ](#セットアップ) 参照）。
 
@@ -202,6 +213,7 @@ python main.py \
 | `--num_iters` | `500` | 反復回数 |
 | `--lr` | `8e-3` | 位相の学習率 |
 | `--lpips_net` | `vgg` | LPIPS バックボーン (`vgg` / `alex`) |
+| `--lambda_lpips` | `0.1` | 損失式 `MSE + λ × LPIPS` の λ。`0` で純粋な MSE（アブレーション用） |
 
 ---
 
@@ -251,18 +263,20 @@ python train_model.py \
 | `--pretrained_path` | `''` | 事前学習済みモデルのパス |
 | `--phase_path` | `./precomputed_phases` | 事前計算済み位相プールのパス |
 | `--calibration_path` | `./calibration` | キャリブレーションパターンのパス |
+| `--lambda_lpips_phase` | `0.1` | 位相最適化の LPIPS 重み λ（`MSE + λ × LPIPS`） |
+| `--lambda_lpips_model` | `0.05` | モデル学習の LPIPS 重み λ（物理的忠実度優先のため小さめ） |
 
 #### 学習の流れ（1バッチあたり）
 
 ```
 Stage 1: 位相最適化
-  シミュレーション振幅 vs 目標画像 → LPIPS 最小化 → 位相を更新
+  シミュレーション振幅 vs 目標画像 → MSE + λ_phase × LPIPS 最小化 → 位相を更新
 
 Stage 2: 物理表示・撮影
   最適化した位相を SLM に表示 → カメラで撮影
 
 Stage 3: モデル学習
-  シミュレーション振幅 vs カメラ撮影 → LPIPS 最小化 → モデルを更新
+  シミュレーション振幅 vs カメラ撮影 → MSE + λ_model × LPIPS 最小化 → モデルを更新
 ```
 
 ---
@@ -314,7 +328,7 @@ python eval.py \
 #### 出力
 
 - `./recon/` — 再構成 sRGB 画像 (`.png`)
-- `./recon/metrics_*.mat` — LPIPS と SSIM の数値データ
+- `./recon/metrics_*.mat` — LPIPS・SSIM・PSNR の数値データ
 
 **`.mat` ファイルの構造:**
 
@@ -326,6 +340,9 @@ lpips_srgb       : LPIPS (sRGB ドメイン) ← 主評価指標
 ssims_amp        : SSIM (振幅ドメイン)
 ssims_lin        : SSIM (線形強度ドメイン)
 ssims_srgb       : SSIM (sRGB ドメイン)
+psnrs_amp        : PSNR (振幅ドメイン, dB)
+psnrs_lin        : PSNR (線形強度ドメイン, dB)
+psnrs_srgb       : PSNR (sRGB ドメイン, dB) ← 既存研究との比較用
 ```
 
 ---
@@ -336,35 +353,44 @@ ssims_srgb       : SSIM (sRGB ドメイン)
 
 ### `utils/utils.py`
 
-- `LPIPSLoss` クラスを追加（`nn.MSELoss` の代替）
+- `LPIPSLoss` クラスを `CombinedLoss` クラスに変更（`MSE + λ × LPIPS` 損失）
+  - `lambda_lpips=0` で純粋な MSE として動作（アブレーション実験対応）
+  - LPIPS ネットワークのパラメータは `requires_grad=False` で固定
+  - `forward()` 後に `self.last_mse` / `self.last_lpips` でコンポーネント値を参照可能
 - `get_psnr_ssim()` → `get_lpips_ssim()` に置換
 - `write_sgd_summary()` / `write_gs_summary()` の TensorBoard ログを PSNR → LPIPS に変更
 
 ### `eval.py`
 
-- `psnrs` → `lpips_vals` に置換
-- LPIPS モデルをループ前に1回だけ初期化（高速化）
-- `.mat` 出力キーを `lpips_*` に変更
+- LPIPS / SSIM に加え **PSNR** を3ドメインで計算・出力（既存研究との比較用）
+- `.mat` 出力に `psnrs_*` キーを追加
 
 ### `main.py`
 
 ```python
 # 変更前
-loss = nn.MSELoss().to(device)
-# 変更後
 loss = utils.LPIPSLoss(net=opt.lpips_net).to(device)
+# 変更後
+loss = utils.CombinedLoss(net=opt.lpips_net, lambda_lpips=opt.lambda_lpips).to(device)
 ```
+
+引数 `--lambda_lpips`（デフォルト `0.1`）を追加。
 
 ### `train_model.py`
 
 ```python
 # 変更前
-loss_phase = nn.MSELoss().to(device)
-loss_model = nn.MSELoss().to(device)
-# 変更後
 loss_phase = utils.LPIPSLoss(net=opt.lpips_net).to(device)
 loss_model = utils.LPIPSLoss(net=opt.lpips_net).to(device)
+# 変更後
+loss_phase = utils.CombinedLoss(net=opt.lpips_net, lambda_lpips=opt.lambda_lpips_phase).to(device)
+loss_model = utils.CombinedLoss(net=opt.lpips_net, lambda_lpips=opt.lambda_lpips_model).to(device)
 ```
+
+引数 `--lambda_lpips_phase`（デフォルト `0.1`）と `--lambda_lpips_model`（デフォルト `0.05`）を追加。
+モデル学習の λ を位相最適化より小さくしている理由：モデルはカメラ画像への物理的忠実度が重要なため。
+
+TensorBoard ログでは各損失の MSE 値・LPIPS 値・合計値を個別に記録します。
 
 ---
 

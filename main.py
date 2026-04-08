@@ -1,12 +1,12 @@
 """
-Neural Holography - CITL with LPIPS:
+Neural Holography - CITL with MSE + LPIPS:
 
 Phase generation using HoloNet/UNET or iterative optimisation (GS/DPAC/SGD)
 with optional Camera-in-the-Loop (CITL).
 
 Modified from the original neural-holography repository:
-  - MSELoss replaced with LPIPSLoss (perceptual loss) for SGD phase optimisation.
-  - TensorBoard summaries now log LPIPS instead of PSNR.
+  - MSE + λ × LPIPS combined loss used for SGD phase optimisation.
+  - TensorBoard summaries log MSE, LPIPS, and combined loss separately.
 
 Original paper:
 Y. Peng, S. Choi, N. Padmanaban, G. Wetzstein. Neural Holography with Camera-in-the-loop
@@ -64,6 +64,9 @@ p.add_argument('--num_iters', type=int, default=500,
                help='Number of iterations (GS, SGD).')
 p.add_argument('--lpips_net', type=str, default='vgg',
                help='LPIPS backbone for the optimisation loss: vgg (default) or alex.')
+p.add_argument('--lambda_lpips', type=float, default=0.1,
+               help='Weight for the LPIPS term in the combined MSE + λ × LPIPS loss. '
+                    'Set to 0 for pure MSE (ablation).')
 
 opt = p.parse_args()
 
@@ -77,7 +80,7 @@ chan_str = ('red', 'green', 'blue')[channel]
 print(f'   - optimising phase with {opt.method}/{opt.prop_model} ...')
 if opt.citl:
     print(f'     with camera-in-the-loop ...')
-print(f'   - optimisation loss: LPIPS ({opt.lpips_net} backbone)')
+print(f'   - optimisation loss: MSE + {opt.lambda_lpips} × LPIPS ({opt.lpips_net} backbone)')
 
 # ---------------------------------------------------------------------------
 # Physical / optical parameters
@@ -93,9 +96,9 @@ dtype        = torch.float32
 device       = torch.device('cuda')
 
 # ---------------------------------------------------------------------------
-# Loss function: LPIPS (perceptual) — replaces MSELoss
+# Loss function: MSE + λ × LPIPS combined loss
 # ---------------------------------------------------------------------------
-loss = utils.LPIPSLoss(net=opt.lpips_net).to(device)
+loss = utils.CombinedLoss(net=opt.lpips_net, lambda_lpips=opt.lambda_lpips).to(device)
 
 s0 = 1.0  # initial amplitude scale
 
