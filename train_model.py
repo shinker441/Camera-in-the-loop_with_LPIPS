@@ -69,6 +69,25 @@ p.add_argument('--lambda_lpips_model', type=float, default=0.05,
 p.add_argument('--lambda_lpips_phase', type=float, default=0.1,
                help='LPIPS weight for phase optimisation loss (MSE + λ × LPIPS).')
 
+# ---------------------------------------------------------------------------
+# Hardware arguments (SLM + Basler camera)
+# ---------------------------------------------------------------------------
+p.add_argument('--slm_settle_time', type=float, default=0.3,
+               help='Seconds to wait after SLM update before camera capture.')
+p.add_argument('--homography_file', type=str, default='',
+               help='Path to .npy file containing pre-computed 3×3 homography '
+                    'matrix H (camera → target plane).  Leave empty to skip.')
+p.add_argument('--slm_flip_udlr', type=utils.str2bool, default=True,
+               help='Flip SLM image 180° before display (for upside-down mounting).')
+p.add_argument('--camera_index', type=int, default=0,
+               help='Basler camera device index (0 = first found).')
+p.add_argument('--monitor_index', type=int, default=1,
+               help='Monitor index for SLM window (1 = second monitor, 0 = primary).')
+p.add_argument('--pixel_format', type=str, default='RGB8',
+               help="Basler pixel format: 'RGB8' (default), 'BGR8', or 'Mono8'.")
+p.add_argument('--pixel_pitch', type=float, default=6.4e-6,
+               help='SLM pixel pitch in metres (default 6.4 μm).')
+
 opt = p.parse_args()
 
 channel = opt.channel
@@ -85,7 +104,7 @@ print(f'     lambda_lpips_phase={opt.lambda_lpips_phase}, lambda_lpips_model={op
 cm, mm, um, nm = 1e-2, 1e-3, 1e-6, 1e-9
 prop_dist    = (20 * cm, 20 * cm, 20 * cm)[channel]
 wavelength   = (638 * nm, 520 * nm, 450 * nm)[channel]
-feature_size = (6.4 * um, 6.4 * um)
+feature_size = (opt.pixel_pitch, opt.pixel_pitch)
 slm_res      = (1080, 1920)
 image_res    = (1080, 1920)
 roi_res      = (880, 1600)
@@ -127,14 +146,19 @@ phase_path = opt.phase_path
 data_path  = './data/train1080'
 
 # ---------------------------------------------------------------------------
-# Hardware setup
+# Hardware setup (SLM + Basler camera)
 # ---------------------------------------------------------------------------
-camera_prop = PhysicalProp(channel, laser_arduino=True,
-                           roi_res=(roi_res[1], roi_res[0]),
-                           slm_settle_time=0.15,
-                           range_row=(220, 1000), range_col=(300, 1630),
-                           patterns_path=opt.calibration_path,
-                           show_preview=True)
+camera_prop = PhysicalProp(
+    channel,
+    slm_settle_time=opt.slm_settle_time,
+    roi_res=(roi_res[1], roi_res[0]),   # (W, H)
+    homography_file=opt.homography_file,
+    slm_flip_udlr=opt.slm_flip_udlr,
+    show_preview=True,
+    camera_index=opt.camera_index,
+    pixel_format=opt.pixel_format,
+    monitor_index=opt.monitor_index,
+)
 
 # ---------------------------------------------------------------------------
 # Propagation model

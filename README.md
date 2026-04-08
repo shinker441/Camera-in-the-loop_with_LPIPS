@@ -72,6 +72,13 @@ LPIPS (Zhang et al., CVPR 2018) は深層特徴量を用いた知覚的類似度
 | PyTorch | 1.9 以上 |
 | CUDA | 10.2 以上 (GPU 必須) |
 
+### ハードウェア（CITL 使用時）
+
+| 機器 | 要件 |
+|------|------|
+| SLM | セカンドモニタとして接続した FHD (1920×1080) SLM |
+| カメラ | Basler カメラ（pypylon でアクセス可能なもの） |
+
 ---
 
 ## セットアップ
@@ -85,16 +92,25 @@ cd neural-holography
 
 ### 2. このリポジトリの変更ファイルを上書きコピー
 
+**重要**: `modules.py` は SGD/GS/DPAC を元ファイルから再インポートするため、
+コピー前に元ファイルを `_modules_orig.py` にリネームしてください。
+
 ```bash
+# 元の modules.py を退避（SGD/GS/DPAC の実装を保持するため必須）
+cp utils/modules.py utils/_modules_orig.py
+
 # このリポジトリをクローン
 git clone https://github.com/shinker441/Camera-in-the-loop_with_LPIPS
 cd Camera-in-the-loop_with_LPIPS
 
 # neural-holography ディレクトリへファイルをコピー
-cp main.py       ../neural-holography/
-cp train_model.py ../neural-holography/
-cp eval.py       ../neural-holography/
-cp utils/utils.py ../neural-holography/utils/
+cp main.py                        ../neural-holography/
+cp train_model.py                  ../neural-holography/
+cp eval.py                         ../neural-holography/
+cp utils/utils.py                  ../neural-holography/utils/
+cp utils/modules.py                ../neural-holography/utils/
+cp utils/slm_display_module.py     ../neural-holography/utils/
+cp utils/camera_capture_module.py  ../neural-holography/utils/
 ```
 
 ### 3. 依存ライブラリのインストール
@@ -103,11 +119,26 @@ cp utils/utils.py ../neural-holography/utils/
 cd ../neural-holography
 pip install -r requirements.txt
 
-# LPIPS を追加インストール
-pip install lpips
+# 追加ライブラリ
+pip install lpips screeninfo pypylon-pylon
 ```
 
-### 4. データセットの配置
+### 4. ホモグラフィ行列の準備（CITL 使用時）
+
+SLMに表示した既知パターンをカメラで撮影し、OpenCV の `findHomography` で
+3×3 ホモグラフィ行列 H を計算して `.npy` 形式で保存してください。
+
+```python
+import numpy as np, cv2
+# src_pts: カメラ上の対応点  (N,2) float32
+# dst_pts: ターゲット平面の対応点 (N,2) float32
+H, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC)
+np.save('./calibration/homography.npy', H)
+```
+
+実行時に `--homography_file=./calibration/homography.npy` で指定します。
+
+### 5. データセットの配置
 
 ```
 neural-holography/
@@ -130,12 +161,13 @@ neural-holography/          ← 元リポジトリ
 ├── propagation_model.py    ← パラメトリック伝播モデル
 ├── holonet.py              ← HoloNet / U-Net ネットワーク
 ├── utils/
-│   ├── utils.py            ← 【変更】ユーティリティ関数 (LPIPS 追加)
-│   ├── modules.py          ← SGD / GS / DPAC / PhysicalProp モジュール
+│   ├── utils.py            ← 【変更】ユーティリティ関数 (MSE+LPIPS 損失)
+│   ├── modules.py          ← 【変更】PhysicalProp (Basler + OpenCV SLM)
+│   ├── _modules_orig.py    ← 元の modules.py をリネームしたもの (SGD/GS/DPAC)
+│   ├── slm_display_module.py     ← 【新規】OpenCV SLM 表示モジュール
+│   ├── camera_capture_module.py  ← 【新規】Basler カメラモジュール (pypylon)
 │   ├── augmented_image_loader.py
-│   ├── camera_capture_module.py   ← FLIR カメラインターフェース
-│   ├── calibration_module.py
-│   └── slm_display_module.py
+│   └── calibration_module.py
 ├── data/
 │   ├── train1080/
 │   └── test/
@@ -167,7 +199,7 @@ python main.py \
   --lpips_net=vgg
 ```
 
-#### CITL（実機カメラを使用した最適化）
+#### CITL（Basler カメラ + OpenCV SLM を使用した最適化）
 
 ```bash
 python main.py \
@@ -177,7 +209,14 @@ python main.py \
   --citl=True \
   --root_path=./phases \
   --data_path=./data \
-  --num_iters=500
+  --num_iters=500 \
+  --homography_file=./calibration/homography.npy \
+  --slm_settle_time=0.3 \
+  --slm_flip_udlr=True \
+  --monitor_index=1 \
+  --camera_index=0 \
+  --pixel_format=RGB8 \
+  --pixel_pitch=6.4e-6
 ```
 
 #### CITL 校正済みモデルを使用
@@ -214,15 +253,22 @@ python main.py \
 | `--lr` | `8e-3` | 位相の学習率 |
 | `--lpips_net` | `vgg` | LPIPS バックボーン (`vgg` / `alex`) |
 | `--lambda_lpips` | `0.1` | 損失式 `MSE + λ × LPIPS` の λ。`0` で純粋な MSE（アブレーション用） |
+| `--slm_settle_time` | `0.3` | SLM 表示後、カメラ撮影までの待機時間 [秒] |
+| `--homography_file` | `''` | ホモグラフィ行列 `.npy` ファイルのパス（空欄でリサイズのみ） |
+| `--slm_flip_udlr` | `True` | SLM 画像を 180° 反転して表示（逆さ設置対応） |
+| `--monitor_index` | `1` | SLM ウィンドウを表示するモニタ番号（1=セカンド） |
+| `--camera_index` | `0` | Basler カメラのデバイス番号 |
+| `--pixel_format` | `RGB8` | Basler ピクセルフォーマット (`RGB8` / `BGR8` / `Mono8`) |
+| `--pixel_pitch` | `6.4e-6` | SLM ピクセルピッチ [m] |
 
 ---
 
 ### 伝播モデル学習 (train_model.py)
 
 CITL によってパラメトリック波面伝播モデルを学習します。  
-位相最適化損失 (`loss_phase`) とモデル学習損失 (`loss_model`) の両方に LPIPS を使用します。
+位相最適化損失 (`loss_phase`) とモデル学習損失 (`loss_model`) の両方に `MSE + λ × LPIPS` を使用します。
 
-> **注意**: 実機の SLM とカメラが接続されている必要があります。
+> **注意**: 実機の SLM（セカンドモニタ）と Basler カメラが接続されている必要があります。
 
 #### 基本実行
 
@@ -232,12 +278,18 @@ python train_model.py \
   --experiment=lpips_test \
   --model_path=./models \
   --phase_path=./precomputed_phases \
-  --calibration_path=./calibration \
   --num_epochs=15 \
   --batch_size=2 \
   --lr_model=3e-3 \
   --lr_phase=5e-3 \
-  --lpips_net=vgg
+  --lpips_net=vgg \
+  --homography_file=./calibration/homography.npy \
+  --slm_settle_time=0.3 \
+  --slm_flip_udlr=True \
+  --monitor_index=1 \
+  --camera_index=0 \
+  --pixel_format=RGB8 \
+  --pixel_pitch=6.4e-6
 ```
 
 #### 事前学習済みモデルから再開
@@ -262,9 +314,15 @@ python train_model.py \
 | `--step_lr` | `True` | StepLR スケジューラを使用 |
 | `--pretrained_path` | `''` | 事前学習済みモデルのパス |
 | `--phase_path` | `./precomputed_phases` | 事前計算済み位相プールのパス |
-| `--calibration_path` | `./calibration` | キャリブレーションパターンのパス |
 | `--lambda_lpips_phase` | `0.1` | 位相最適化の LPIPS 重み λ（`MSE + λ × LPIPS`） |
 | `--lambda_lpips_model` | `0.05` | モデル学習の LPIPS 重み λ（物理的忠実度優先のため小さめ） |
+| `--slm_settle_time` | `0.3` | SLM 表示後、撮影までの待機時間 [秒] |
+| `--homography_file` | `''` | ホモグラフィ行列 `.npy` ファイルのパス |
+| `--slm_flip_udlr` | `True` | SLM 画像を 180° 反転して表示 |
+| `--monitor_index` | `1` | SLM ウィンドウのモニタ番号 |
+| `--camera_index` | `0` | Basler カメラのデバイス番号 |
+| `--pixel_format` | `RGB8` | Basler ピクセルフォーマット |
+| `--pixel_pitch` | `6.4e-6` | SLM ピクセルピッチ [m] |
 
 #### 学習の流れ（1バッチあたり）
 
@@ -374,7 +432,7 @@ loss = utils.LPIPSLoss(net=opt.lpips_net).to(device)
 loss = utils.CombinedLoss(net=opt.lpips_net, lambda_lpips=opt.lambda_lpips).to(device)
 ```
 
-引数 `--lambda_lpips`（デフォルト `0.1`）を追加。
+引数 `--lambda_lpips`（デフォルト `0.1`）および SLM/カメラ関連引数を追加。
 
 ### `train_model.py`
 
@@ -387,10 +445,36 @@ loss_phase = utils.CombinedLoss(net=opt.lpips_net, lambda_lpips=opt.lambda_lpips
 loss_model = utils.CombinedLoss(net=opt.lpips_net, lambda_lpips=opt.lambda_lpips_model).to(device)
 ```
 
-引数 `--lambda_lpips_phase`（デフォルト `0.1`）と `--lambda_lpips_model`（デフォルト `0.05`）を追加。
+引数 `--lambda_lpips_phase`（デフォルト `0.1`）と `--lambda_lpips_model`（デフォルト `0.05`）および SLM/カメラ関連引数を追加。
 モデル学習の λ を位相最適化より小さくしている理由：モデルはカメラ画像への物理的忠実度が重要なため。
 
 TensorBoard ログでは各損失の MSE 値・LPIPS 値・合計値を個別に記録します。
+
+### `utils/modules.py` (新規)
+
+元の HOLOEYE SDK + FLIR PyCapture2 ベースの `PhysicalProp` を差し替え。
+
+```
+旧: HOLOEYE SDK で SLM 表示 + FLIR PyCapture2 でカメラ撮影
+新: OpenCV (cv2.imshow) でセカンドモニタに SLM 表示 + pypylon で Basler カメラ撮影
+```
+
+- `SGD` / `GS` / `DPAC` は元の `_modules_orig.py` から再インポート（動作を維持）
+- `PhysicalProp.forward()`: 位相テンソル (1,1,H,W) → 振幅テンソル (1,1,H,W)
+- ホモグラフィ行列を `.npy` ファイルから読み込んで warpPerspective 適用
+- `camera_prop.alc.disconnect()` 呼び出しは `_DummyALC` スタブで互換対応
+
+### `utils/slm_display_module.py` (新規)
+
+- `screeninfo.get_monitors()` でセカンドモニタを検出
+- `cv2.namedWindow` + `cv2.setWindowProperty(FULLSCREEN)` でフルスクリーン表示
+- `slm_flip_udlr=True` で 180° 反転（`cv2.flip(img, -1)`）
+
+### `utils/camera_capture_module.py` (新規)
+
+- `pypylon` で Basler カメラを初期化（RGB8 / BGR8 / Mono8 自動フォールバック）
+- `grab_gray()`: フレームをグレースケール float32 \[0, 1\] で返す
+- pypylon の RGB8 出力を `cv2.cvtColor(RGB→BGR)` で変換
 
 ---
 
