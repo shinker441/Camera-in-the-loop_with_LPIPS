@@ -1,40 +1,99 @@
 """
-This is the script containing SLM display module (HOLOEYE).
-Refer to this interface and modify it to match your SLM SDK.
+SLM display module — OpenCV fullscreen window on a secondary monitor.
 
-This code and data is released under the Creative Commons Attribution-NonCommercial 4.0 International license (CC BY-NC.) In a nutshell:
-    # The license is only for non-commercial use (commercial licenses can be obtained from Stanford).
-    # The material is provided as-is, with no warranties whatsoever.
-    # If you publish any code, data, or scientific work based on this, please cite our work.
-
-Technical Paper:
-Y. Peng, S. Choi, N. Padmanaban, G. Wetzstein. Neural Holography with Camera-in-the-loop Training. ACM TOG (SIGGRAPH Asia), 2020.
+Replaces the original HOLOEYE SDK-based SLM control in neural-holography.
 """
 
-import utils.detect_heds_module_path
-import holoeye
-from holoeye import slmdisplaysdk
+import cv2
+import numpy as np
+
+try:
+    import screeninfo
+    _HAVE_SCREENINFO = True
+except ImportError:
+    _HAVE_SCREENINFO = False
 
 
 class SLMDisplay:
-    def __init__(self):
-        self.ErrorCode = slmdisplaysdk.SLMDisplay.ErrorCode
-        self.ShowFlags = slmdisplaysdk.SLMDisplay.ShowFlags
+    """Controls an SLM via an OpenCV fullscreen window on a secondary monitor.
 
-        self.displayOptions = self.ShowFlags.PresentAutomatic  # PresentAutomatic == 0 (default)
-        self.displayOptions |= self.ShowFlags.PresentFitWithBars
+    The phase image (uint8, 0-255) is displayed on the monitor at *monitor_index*.
+    If the monitor is mounted upside-down, set slm_flip_udlr=True to rotate 180°.
 
-    def connect(self):
-        self.slm_device = slmdisplaysdk.SLMDisplay()
-        self.slm_device.open()  # For version 2.0.1
+    Args:
+        slm_flip_udlr: Flip the image 180° before sending to the SLM.
+        monitor_index: Target monitor index (1 = second monitor, 0 = primary).
+        slm_res:       (width, height) of the SLM in pixels, default FHD (1920×1080).
+        window_name:   OpenCV window title string.
+    """
 
-    def disconnect(self):
-        self.slm_device.release()
+    _DEFAULT_WINDOW = "SLM Display"
 
-    def show_data_from_file(self, filepath):
-        error = self.slm_device.showDataFromFile(filepath, self.displayOptions)
-        assert error == self.ErrorCode.NoError, self.slm_device.errorString(error)
+    def __init__(self,
+                 slm_flip_udlr: bool = True,
+                 monitor_index: int = 1,
+                 slm_res: tuple = (1920, 1080),
+                 window_name: str = _DEFAULT_WINDOW):
+        self.slm_flip_udlr = slm_flip_udlr
+        self.slm_res = slm_res          # (W, H)
+        self.window_name = window_name
+        self._init_window(monitor_index)
 
-    def show_data_from_array(self, numpy_array):
-        error = self.slm_device.showData(numpy_array)
-        assert error == self.ErrorCode.NoError, self.slm_device.errorString(error)
+    # ------------------------------------------------------------------
+    # Initialisation
+    # ------------------------------------------------------------------
+
+    def _init_window(self, monitor_index: int) -> None:
+        slm_mon = self._select_monitor(monitor_index)
+
+        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        if slm_mon is not None:
+            cv2.moveWindow(self.window_name, slm_mon.x, slm_mon.y)
+        cv2.resizeWindow(self.window_name, self.slm_res[0], self.slm_res[1])
+        cv2.setWindowProperty(
+            self.window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN
+        )
+
+        # Show a black frame immediately to confirm the window is alive
+        black = np.zeros((self.slm_res[1], self.slm_res[0]), dtype=np.uint8)
+        cv2.imshow(self.window_name, black)
+        cv2.waitKey(1)
+
+    @staticmethod
+    def _select_monitor(index: int):
+        """Return the screeninfo Monitor object at *index*, or None."""
+        if not _HAVE_SCREENINFO:
+            return None
+        try:
+            monitors = screeninfo.get_monitors()
+            if index < len(monitors):
+                return monitors[index]
+            return monitors[0] if monitors else None
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def display(self, phase_u8: np.ndarray) -> None:
+        """Send a uint8 phase map to the SLM window.
+
+        Args:
+            phase_u8: numpy array of shape (H, W), dtype uint8, values 0-255.
+                      Will be resized to slm_res if needed.
+        """
+        img = phase_u8
+        if img.shape != (self.slm_res[1], self.slm_res[0]):
+            img = cv2.resize(img, self.slm_res, interpolation=cv2.INTER_NEAREST)
+        if self.slm_flip_udlr:
+            img = cv2.flip(img, -1)   # 180° rotation
+        cv2.imshow(self.window_name, img)
+        cv2.waitKey(1)
+
+    def close(self) -> None:
+        """Destroy the SLM window."""
+        try:
+            cv2.destroyWindow(self.window_name)
+        except Exception:
+            pass

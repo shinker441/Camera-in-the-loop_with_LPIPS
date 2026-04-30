@@ -2,3 +2,8 @@
 .DS_Store?
 __pycache__/
 .idea/*
+data/
+phases/
+runs/
+utils/utils.py.bak
+utils/_modules_orig.py

@@ -1,86 +1,153 @@
 """
-This is the script containing Camera module (PyCapture).
-Refer to this interface and modify it to match your camera SDK
+Basler camera capture module — pypylon interface.
 
-This code and data is released under the Creative Commons Attribution-NonCommercial 4.0 International license (CC BY-NC.) In a nutshell:
-    # The license is only for non-commercial use (commercial licenses can be obtained from Stanford).
-    # The material is provided as-is, with no warranties whatsoever.
-    # If you publish any code, data, or scientific work based on this, please cite our work.
-
-Technical Paper:
-Y. Peng, S. Choi, N. Padmanaban, G. Wetzstein. Neural Holography with Camera-in-the-loop Training. ACM TOG (SIGGRAPH Asia), 2020.
+Replaces the original FLIR PyCapture2-based camera control in neural-holography.
 """
 
-import PyCapture2
-import cv2
 import numpy as np
-import time
-import utils.utils as utils
+
+try:
+    from pypylon import pylon
+    _HAVE_PYPYLON = True
+except ImportError:
+    _HAVE_PYPYLON = False
 
 
-def callback_captured(image):
-    print(image.getData())
+class BaslerCamera:
+    """Basler camera interface using pypylon.
 
+    Opens the camera device, configures pixel format and resolution, and
+    provides grab helpers that return NumPy arrays.
 
-class CameraCapture:
-    def __init__(self):
-        self.bus = PyCapture2.BusManager()
-        num_cams = self.bus.getNumOfCameras()
-        if not num_cams:
-            exit()
+    Args:
+        camera_index: Device index among enumerated Basler cameras (0 = first).
+        pixel_format: Requested pixel format.  Tried in order until one works:
+                      the requested format → 'BGR8' → 'Mono8'.
+        timeout_ms:   Grab timeout in milliseconds.
+    """
 
-    def connect(self, i):
-        uid = self.bus.getCameraFromIndex(i)
-        self.camera_device = PyCapture2.Camera()
-        self.camera_device.connect(uid)
-        self.toggle_embedded_timestamp(True)
+    def __init__(self,
+                 camera_index: int = 0,
+                 pixel_format: str = 'RGB8',
+                 timeout_ms: int = 2000):
+        if not _HAVE_PYPYLON:
+            raise ImportError(
+                "pypylon is not installed.  "
+                "Install it with:  pip install pypylon-pylon"
+            )
+        self.timeout_ms = timeout_ms
+        self._pixel_format = None   # resolved format (set in _init_camera)
+        self._cam = self._init_camera(camera_index, pixel_format)
 
-    def disconnect(self):
-        self.toggle_embedded_timestamp(False)
-        self.camera_device.disconnect()
+    # ------------------------------------------------------------------
+    # Initialisation
+    # ------------------------------------------------------------------
 
-    def toggle_embedded_timestamp(self, enable_timestamp):
-        embedded_info = self.camera_device.getEmbeddedImageInfo()
-        if embedded_info.available.timestamp:
-            self.camera_device.setEmbeddedImageInfo(timestamp=enable_timestamp)
+    def _init_camera(self, index: int, preferred_format: str):
+        devices = pylon.TlFactory.GetInstance().EnumerateDevices()
+        if not devices:
+            raise RuntimeError("No Basler camera found.  Check USB/GigE connection.")
 
-    def grab_images(self, num_images_to_grab=1):
-        """
-        Retrieve the camera buffer and returns a list of grabbed images.
+        cam = pylon.InstantCamera(
+            pylon.TlFactory.GetInstance().CreateDevice(devices[index])
+        )
+        cam.Open()
 
-        :param num_images_to_grab: integer, default 1
-        :return: a list of numpy 2d color images from the camera buffer.
-        """
-        self.camera_device.startCapture()
-
-        img_list = []
-        for i in range(num_images_to_grab):
+        # Try preferred format, fall back gracefully
+        for fmt in (preferred_format, 'BGR8', 'Mono8'):
             try:
-                img = self.camera_device.retrieveBuffer()
-            except PyCapture2.Fc2error as fc2Err:
+                cam.PixelFormat.Value = fmt
+                self._pixel_format = fmt
+                break
+            except Exception:
                 continue
 
-            imgData = img.getData()
+        cam.Width.Value  = cam.Width.Max
+        cam.Height.Value = cam.Height.Max
+        cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+        print(f"[BaslerCamera] opened device {index}, pixel_format={self._pixel_format}, "
+              f"res={cam.Width.Value}×{cam.Height.Value}")
+        return cam
 
-            # when using raw8 from the PG sensor
-            # cv_image = np.array(img.getData(), dtype="uint8").reshape((img.getRows(), img.getCols()))
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-            # when using raw16 from the PG sensor - concat 2 8bits in a row
-            imgData.dtype = np.uint16
-            imgData = imgData.reshape(img.getRows(), img.getCols())
-            offset = 64  # offset that inherently exist.
-            imgData = imgData - offset
+    def grab(self) -> np.ndarray:
+        """Grab one frame and return as a NumPy array (BGR or grayscale uint8).
 
-            color_cv_image = cv2.cvtColor(imgData, cv2.COLOR_BAYER_RG2BGR)
-            color_cv_image = utils.im2float(color_cv_image)
-            img_list.append(color_cv_image.copy())
+        - RGB8 frames are converted to BGR for OpenCV compatibility.
+        - Mono8 frames are returned as (H, W) uint8.
+        - Returns None if the grab failed or timed out.
+        """
+        r = self._cam.RetrieveResult(
+            self.timeout_ms, pylon.TimeoutHandling_Return
+        )
+        if r is None or not r.GrabSucceeded():
+            if r:
+                r.Release()
+            return None
 
-        self.camera_device.stopCapture()
-        return img_list
+        img = r.Array.copy()
+        r.Release()
+
+        # pypylon returns RGB8 as (H, W, 3) in RGB order → convert to BGR
+        if img.ndim == 3 and img.shape[2] == 3 and self._pixel_format == 'RGB8':
+            import cv2
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+        return img
+
+    def grab_gray(self) -> np.ndarray:
+        """Grab a frame and return as float32 grayscale in [0, 1].
+
+        Returns None if the grab failed.
+        """
+        img = self.grab()
+        if img is None:
+            return None
+
+        if img.ndim == 3:
+            import cv2
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        return img.astype(np.float32) / 255.0
+
+    def close(self) -> None:
+        """Stop grabbing and close the camera."""
+        try:
+            if self._cam.IsGrabbing():
+                self._cam.StopGrabbing()
+            if self._cam.IsOpen():
+                self._cam.Close()
+            print("[BaslerCamera] closed.")
+        except Exception:
+            pass
+
+# ------------------------------------------------------------------
+# Compatibility shim for original neural-holography imports
+# ------------------------------------------------------------------
+class CameraCapture(BaslerCamera):
+    def __init__(self, *args, camera_index=0, pixel_format="Mono8", **kwargs):
+        super().__init__(camera_index=camera_index, pixel_format=pixel_format)
+
+    def connect(self, i=0):
+        # BaslerCamera opens in __init__, so keep this as a no-op
+        return None
+
+    def disconnect(self):
+        return self.close()
+
+    def grab_images(self, num_images_to_grab=1):
+        imgs = []
+        for _ in range(num_images_to_grab):
+            img = self.grab()
+            if img is not None:
+                imgs.append(img)
+        return imgs
 
     def start_capture(self):
-        # these two were previously inside the grab_images func, and can be clarified outside the loop
-        self.camera_device.startCapture()
+        return None
 
     def stop_capture(self):
-        self.camera_device.stopCapture()
+        return None

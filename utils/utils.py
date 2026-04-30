@@ -1,108 +1,158 @@
 """
-This is the script containing all uility functions used for the implementation.
+Neural Holography - CITL with MSE + LPIPS:
 
-This code and data is released under the Creative Commons Attribution-NonCommercial 4.0 International license (CC BY-NC.) In a nutshell:
-    # The license is only for non-commercial use (commercial licenses can be obtained from Stanford).
-    # The material is provided as-is, with no warranties whatsoever.
-    # If you publish any code, data, or scientific work based on this, please cite our work.
+Utility functions. Modified from the original neural-holography repository to use
+MSE + λ × LPIPS as the combined optimisation loss, and LPIPS/SSIM/PSNR as evaluation metrics.
 
-Technical Paper:
-Y. Peng, S. Choi, N. Padmanaban, G. Wetzstein. Neural Holography with Camera-in-the-loop Training. ACM TOG (SIGGRAPH Asia), 2020.
+Original paper:
+Y. Peng, S. Choi, N. Padmanaban, G. Wetzstein. Neural Holography with Camera-in-the-loop Training.
+ACM TOG (SIGGRAPH Asia), 2020.
+
+LPIPS paper:
+R. Zhang, P. Isola, A. Efros, E. Shechtman, O. Wang. The Unreasonable Effectiveness of Deep Features
+as a Perceptual Metric. CVPR, 2018.
+
+This code is released under CC BY-NC 4.0. Non-commercial use only.
 """
+
 import math
 import numpy as np
-
 import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as func
 import torch.nn.modules.loss as ll
 
-from skimage.metrics import peak_signal_noise_ratio as psnr
+import lpips
 from skimage.metrics import structural_similarity as ssim
 
 
-def mul_complex(t1, t2):
-    """multiply two complex valued tensors element-wise. the two last dimensions are
-    assumed to be the real and imaginary part
+# ---------------------------------------------------------------------------
+# Combined loss: MSE + λ × LPIPS
+# ---------------------------------------------------------------------------
 
-    complex multiplication: (a+bi)(c+di) = (ac-bd) + (bc+ad)i
+class CombinedLoss(nn.Module):
+    """Combined MSE + λ × LPIPS loss for hologram phase optimisation.
+
+    MSE provides stable pixel-level gradients that guarantee convergence.
+    LPIPS guides the optimisation toward perceptually better quality.
+    Setting lambda_lpips=0 recovers pure MSE (useful for ablation studies).
+
+    Accepts amplitude tensors in [0, 1] range with shape (N, C, H, W).
+    Single-channel inputs are repeated to 3 channels for LPIPS.
+    LPIPS network parameters are frozen (requires_grad=False).
+
+    After each forward() call, the component values are available as:
+        self.last_mse   — MSE term (detached scalar tensor)
+        self.last_lpips — LPIPS term (detached scalar tensor)
+
+    Args:
+        net:          LPIPS backbone. 'vgg' recommended for training loss;
+                      'alex' is faster and better for evaluation only.
+        lambda_lpips: Weight for the LPIPS term (default 0.1).
+                      Set to 0 for pure MSE.
     """
-    # real and imaginary parts of first tensor
-    a, b = t1.split(1, 4)
-    # real and imaginary parts of second tensor
-    c, d = t2.split(1, 4)
 
-    # multiply out
+    def __init__(self, net='vgg', lambda_lpips=0.1):
+        super().__init__()
+        self.lambda_lpips = lambda_lpips
+        self.mse_loss = nn.MSELoss()
+        self.lpips_net = lpips.LPIPS(net=net)
+        for param in self.lpips_net.parameters():
+            param.requires_grad = False
+        self.last_mse = None
+        self.last_lpips = None
+
+    def forward(self, input, target):
+        mse_val = self.mse_loss(input, target)
+
+        if self.lambda_lpips > 0:
+            input_3ch = self._to_3ch(input)
+            target_3ch = self._to_3ch(target)
+            lpips_val = self.lpips_net(input_3ch, target_3ch).mean()
+        else:
+            lpips_val = torch.zeros(1, device=input.device)
+
+        self.last_mse = mse_val.detach()
+        self.last_lpips = lpips_val.detach()
+
+        return mse_val + self.lambda_lpips * lpips_val
+
+    @staticmethod
+    def _to_3ch(amp):
+        """Scale [0,1] → [-1,1] and repeat to 3 channels for LPIPS."""
+        x = amp.clamp(0.0, 1.0) * 2.0 - 1.0
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+        return x
+
+
+def _prep_amp_for_lpips(amp):
+    """Ensure a tensor is (N, C, H, W), scale [0,1]→[-1,1], expand to 3 ch."""
+    x = amp.clone()
+    while x.dim() < 4:
+        x = x.unsqueeze(0)
+    x = x.clamp(0.0, 1.0) * 2.0 - 1.0
+    if x.shape[1] == 1:
+        x = x.expand(-1, 3, -1, -1)
+    return x
+
+
+def _numpy_to_lpips_tensor(arr, device):
+    """Convert a numpy amplitude array to a 4-D LPIPS-ready tensor on *device*."""
+    t = torch.from_numpy(np.ascontiguousarray(arr)).float()
+    if t.ndim == 2:                       # (H, W)
+        t = t.unsqueeze(0).unsqueeze(0)   # → (1, 1, H, W)
+    elif t.ndim == 3:                     # (H, W, C)
+        t = t.permute(2, 0, 1).unsqueeze(0)  # → (1, C, H, W)
+    t = t.to(device)
+    t = t.clamp(0.0, 1.0) * 2.0 - 1.0
+    if t.shape[1] == 1:
+        t = t.expand(-1, 3, -1, -1)
+    return t
+
+
+# ---------------------------------------------------------------------------
+# Complex-field utilities (unchanged from original)
+# ---------------------------------------------------------------------------
+
+def mul_complex(t1, t2):
+    a, b = t1.split(1, 4)
+    c, d = t2.split(1, 4)
     return torch.cat((a * c - b * d, b * c + a * d), 4)
 
 
 def div_complex(t1, t2):
-    """divide two complex valued tensors element-wise. the two last dimensions are
-    assumed to be the real and imaginary part
-
-    complex division: (a+bi) / (c+di) = (ac+bd)/(c^2+d^2) + (bc-ad)/(c^2+d^2) i
-    """
-    # real and imaginary parts of first tensor
     (a, b) = t1.split(1, 4)
-    # real and imaginary parts of second tensor
     (c, d) = t2.split(1, 4)
-
-    # get magnitude
     mag = torch.mul(c, c) + torch.mul(d, d)
-
-    # multiply out
     return torch.cat(((a * c + b * d) / mag, (b * c - a * d) / mag), 4)
 
 
 def reciprocal_complex(t):
-    """element-wise inverse of complex-valued tensor
-
-    reciprocal of complex number z=a+bi:
-    1/z = a / (a^2 + b^2) - ( b / (a^2 + b^2) ) i
-    """
-    # real and imaginary parts of first tensor
     (a, b) = t.split(1, 4)
-
-    # get magnitude
     mag = torch.mul(a, a) + torch.mul(b, b)
-
-    # multiply out
     return torch.cat((a / mag, -(b / mag)), 4)
 
 
 def rect_to_polar(real, imag):
-    """Converts the rectangular complex representation to polar"""
     mag = torch.pow(real**2 + imag**2, 0.5)
     ang = torch.atan2(imag, real)
     return mag, ang
 
 
 def polar_to_rect(mag, ang):
-    """Converts the polar complex representation to rectangular"""
     real = mag * torch.cos(ang)
     imag = mag * torch.sin(ang)
     return real, imag
 
 
 def replace_amplitude(field, amplitude):
-    """takes a Complex tensor with real/imag channels, converts to
-    amplitude/phase, replaces amplitude, then converts back to real/imag
-
-    resolution of both Complex64 tensors should be (M, N, height, width)
-    """
-    # replace amplitude with target amplitude and convert back to real/imag
     real, imag = polar_to_rect(amplitude, field.angle())
-
-    # concatenate
     return torch.complex(real, imag)
 
 
 def ifftshift(tensor):
-    """ifftshift for tensors of dimensions [minibatch_size, num_channels, height, width, 2]
-
-    shifts the width and heights
-    """
     size = tensor.size()
     tensor_shifted = roll_torch(tensor, -math.floor(size[2] / 2.0), 2)
     tensor_shifted = roll_torch(tensor_shifted, -math.floor(size[3] / 2.0), 3)
@@ -110,10 +160,6 @@ def ifftshift(tensor):
 
 
 def fftshift(tensor):
-    """fftshift for tensors of dimensions [minibatch_size, num_channels, height, width, 2]
-
-    shifts the width and heights
-    """
     size = tensor.size()
     tensor_shifted = roll_torch(tensor, math.floor(size[2] / 2.0), 2)
     tensor_shifted = roll_torch(tensor_shifted, math.floor(size[3] / 2.0), 3)
@@ -121,63 +167,47 @@ def fftshift(tensor):
 
 
 def ifft2(tensor_re, tensor_im, shift=False):
-    """Applies a 2D ifft to the complex tensor represented by tensor_re and _im"""
     tensor_out = torch.stack((tensor_re, tensor_im), 4)
-
     if shift:
         tensor_out = ifftshift(tensor_out)
     (tensor_out_re, tensor_out_im) = torch.ifft(tensor_out, 2, True).split(1, 4)
-
     tensor_out_re = tensor_out_re.squeeze(4)
     tensor_out_im = tensor_out_im.squeeze(4)
-
     return tensor_out_re, tensor_out_im
 
 
 def fft2(tensor_re, tensor_im, shift=False):
-    """Applies a 2D fft to the complex tensor represented by tensor_re and _im"""
-    # fft2
     (tensor_out_re, tensor_out_im) = torch.fft(torch.stack((tensor_re, tensor_im), 4), 2, True).split(1, 4)
-
     tensor_out_re = tensor_out_re.squeeze(4)
     tensor_out_im = tensor_out_im.squeeze(4)
-
-    # apply fftshift
     if shift:
         tensor_out_re = fftshift(tensor_out_re)
         tensor_out_im = fftshift(tensor_out_im)
-
     return tensor_out_re, tensor_out_im
 
 
 def roll_torch(tensor, shift, axis):
-    """implements numpy roll() or Matlab circshift() functions for tensors"""
     if shift == 0:
         return tensor
-
     if axis < 0:
         axis += tensor.dim()
-
     dim_size = tensor.size(axis)
     after_start = dim_size - shift
     if shift < 0:
         after_start = -shift
         shift = dim_size - abs(shift)
-
     before = tensor.narrow(axis, 0, dim_size - shift)
     after = tensor.narrow(axis, after_start, shift)
     return torch.cat([after, before], axis)
 
 
 def pad_stacked_complex(field, pad_width, padval=0, mode='constant'):
-    """Helper for pad_image() that pads a real padval in a complex-aware manner"""
     if padval == 0:
-        pad_width = (0, 0, *pad_width)  # add 0 padding for stacked_complex dimension
+        pad_width = (0, 0, *pad_width)
         return nn.functional.pad(field, pad_width, mode=mode)
     else:
         if isinstance(padval, torch.Tensor):
             padval = padval.item()
-
         real, imag = field[..., 0], field[..., 1]
         real = nn.functional.pad(real, pad_width, mode=mode, value=padval)
         imag = nn.functional.pad(imag, pad_width, mode=mode, value=0)
@@ -185,21 +215,6 @@ def pad_stacked_complex(field, pad_width, padval=0, mode='constant'):
 
 
 def pad_image(field, target_shape, pytorch=True, stacked_complex=True, padval=0, mode='constant'):
-    """Pads a 2D complex field up to target_shape in size
-
-    Padding is done such that when used with crop_image(), odd and even dimensions are
-    handled correctly to properly undo the padding.
-
-    field: the field to be padded. May have as many leading dimensions as necessary
-        (e.g., batch or channel dimensions)
-    target_shape: the 2D target output dimensions. If any dimensions are smaller
-        than field, no padding is applied
-    pytorch: if True, uses torch functions, if False, uses numpy
-    stacked_complex: for pytorch=True, indicates that field has a final dimension
-        representing real and imag
-    padval: the real number value to pad by
-    mode: padding mode for numpy or torch
-    """
     if pytorch:
         if stacked_complex:
             size_diff = np.array(target_shape) - np.array(field.shape[-3:-1])
@@ -211,14 +226,13 @@ def pad_image(field, target_shape, pytorch=True, stacked_complex=True, padval=0,
         size_diff = np.array(target_shape) - np.array(field.shape[-2:])
         odd_dim = np.array(field.shape[-2:]) % 2
 
-    # pad the dimensions that need to increase in size
     if (size_diff > 0).any():
         pad_total = np.maximum(size_diff, 0)
         pad_front = (pad_total + odd_dim) // 2
         pad_end = (pad_total + 1 - odd_dim) // 2
 
         if pytorch:
-            pad_axes = [int(p)  # convert from np.int64
+            pad_axes = [int(p)
                         for tple in zip(pad_front[::-1], pad_end[::-1])
                         for p in tple]
             if stacked_complex:
@@ -226,7 +240,7 @@ def pad_image(field, target_shape, pytorch=True, stacked_complex=True, padval=0,
             else:
                 return nn.functional.pad(field, pad_axes, mode=mode, value=padval)
         else:
-            leading_dims = field.ndim - 2  # only pad the last two dims
+            leading_dims = field.ndim - 2
             if leading_dims > 0:
                 pad_front = np.concatenate(([0] * leading_dims, pad_front))
                 pad_end = np.concatenate(([0] * leading_dims, pad_end))
@@ -237,10 +251,6 @@ def pad_image(field, target_shape, pytorch=True, stacked_complex=True, padval=0,
 
 
 def crop_image(field, target_shape, pytorch=True, stacked_complex=True):
-    """Crops a 2D field, see pad_image() for details
-
-    No cropping is done if target_shape is already smaller than field
-    """
     if target_shape is None:
         return field
 
@@ -255,7 +265,6 @@ def crop_image(field, target_shape, pytorch=True, stacked_complex=True):
         size_diff = np.array(field.shape[-2:]) - np.array(target_shape)
         odd_dim = np.array(field.shape[-2:]) % 2
 
-    # crop dimensions that need to decrease in size
     if (size_diff > 0).any():
         crop_total = np.maximum(size_diff, 0)
         crop_front = (crop_total + 1 - odd_dim) // 2
@@ -271,19 +280,25 @@ def crop_image(field, target_shape, pytorch=True, stacked_complex=True):
         return field
 
 
+# ---------------------------------------------------------------------------
+# Color-space helpers (unchanged from original)
+# ---------------------------------------------------------------------------
+
 def srgb_gamma2lin(im_in):
-    """converts from sRGB to linear color space"""
     thresh = 0.04045
     im_out = np.where(im_in <= thresh, im_in / 12.92, ((im_in + 0.055) / 1.055)**(2.4))
     return im_out
 
 
 def srgb_lin2gamma(im_in):
-    """converts from linear to sRGB color space"""
     thresh = 0.0031308
     im_out = np.where(im_in <= thresh, 12.92 * im_in, 1.055 * (im_in**(1 / 2.4)) - 0.055)
     return im_out
 
+
+# ---------------------------------------------------------------------------
+# Misc utilities (unchanged from original)
+# ---------------------------------------------------------------------------
 
 def cond_mkdir(path):
     if not os.path.exists(path):
@@ -291,39 +306,21 @@ def cond_mkdir(path):
 
 
 def phasemap_8bit(phasemap, inverted=True):
-    """convert a phasemap tensor into a numpy 8bit phasemap that can be directly displayed
-
-    Input
-    -----
-    :param phasemap: input phasemap tensor, which is supposed to be in the range of [-pi, pi].
-    :param inverted: a boolean value that indicates whether the phasemap is inverted.
-
-    Output
-    ------
-    :return: output phasemap, with uint8 dtype (in [0, 255])
-    """
-
     output_phase = ((phasemap + np.pi) % (2 * np.pi)) / (2 * np.pi)
     if inverted:
-        phase_out_8bit = ((1 - output_phase) * 255).round().cpu().detach().squeeze().numpy().astype(np.uint8)  # quantized to 8 bits
+        phase_out_8bit = ((1 - output_phase) * 255).round().cpu().detach().squeeze().numpy().astype(np.uint8)
     else:
-        phase_out_8bit = ((output_phase) * 255).round().cpu().detach().squeeze().numpy().astype(np.uint8)  # quantized to 8 bits
+        phase_out_8bit = ((output_phase) * 255).round().cpu().detach().squeeze().numpy().astype(np.uint8)
     return phase_out_8bit
 
 
 def burst_img_processor(img_burst_list):
     img_tensor = np.stack(img_burst_list, axis=0)
     img_avg = np.mean(img_tensor, axis=0)
-    return im2float(img_avg)  # changed from int8 to float32
+    return im2float(img_avg)
 
 
 def im2float(im, dtype=np.float32):
-    """convert uint16 or uint8 image to float32, with range scaled to 0-1
-
-    :param im: image
-    :param dtype: default np.float32
-    :return:
-    """
     if issubclass(im.dtype.type, np.floating):
         return im.astype(dtype)
     elif issubclass(im.dtype.type, np.integer):
@@ -334,32 +331,10 @@ def im2float(im, dtype=np.float32):
 
 def propagate_field(input_field, propagator, prop_dist=0.2, wavelength=520e-9, feature_size=(6.4e-6, 6.4e-6),
                     prop_model='ASM', dtype=torch.float32, precomputed_H=None):
-    """
-    A wrapper for various propagation methods, including the parameterized model.
-    Note that input_field is supposed to be in Cartesian coordinate, not polar!
-
-    Input
-    -----
-    :param input_field: pytorch complex tensor shape of (1, C, H, W), the field before propagation, in X, Y coordinates
-    :param prop_dist: propagation distance in m.
-    :param wavelength: wavelength of the wave in m.
-    :param feature_size: pixel pitch
-    :param prop_model: propagation model ('ASM', 'MODEL', 'fresnel', ...)
-    :param trained_model: function or model instance for propagation
-    :param dtype: torch.float32 by default
-    :param precomputed_H: Propagation Kernel in Fourier domain (could be calculated at the very first time and reuse)
-
-    Output
-    -----
-    :return: output_field: pytorch complex tensor shape of (1, C, H, W), the field after propagation, in X, Y coordinates
-    """
-
     if prop_model == 'ASM':
         output_field = propagator(u_in=input_field, z=prop_dist, feature_size=feature_size, wavelength=wavelength,
                                   dtype=dtype, precomped_H=precomputed_H)
     elif 'MODEL' in prop_model.upper():
-        # forward propagate through our citl-calibrated model.
-        # You can directly use this model propagation, not using this wrapper module.
         _, input_phase = rect_to_polar(input_field.real, input_field.imag)
         output_field = propagator(input_phase)
     elif prop_model == 'CAMERA':
@@ -367,50 +342,82 @@ def propagate_field(input_field, propagator, prop_dist=0.2, wavelength=520e-9, f
         output_field = propagator(input_phase)
     else:
         raise ValueError('Unexpected prop_model value')
-
     return output_field
 
 
+# ---------------------------------------------------------------------------
+# TensorBoard summary functions — PSNR replaced with LPIPS
+# ---------------------------------------------------------------------------
+
 def write_sgd_summary(slm_phase, out_amp, target_amp, k,
-                      writer=None, path=None, s=0., prefix='test'):
-    """tensorboard summary for SGD
+                      writer=None, path=None, s=0., prefix='test', lpips_fn=None):
+    """TensorBoard summary for SGD. Uses LPIPS instead of PSNR.
 
-    :param slm_phase: Use it if you want to save intermediate phases during optimization.
-    :param out_amp: PyTorch Tensor, Field amplitude at the image plane.
-    :param target_amp: PyTorch Tensor, Ground Truth target Amplitude.
-    :param k: iteration number.
-    :param writer: SummaryWriter instance.
-    :param path: path to save image files.
-    :param s: scale for SGD algorithm.
-    :param prefix:
-    :return:
+    Args:
+        slm_phase: SLM phase tensor (unused here, kept for API compatibility).
+        out_amp:   Reconstructed amplitude tensor.
+        target_amp: Target amplitude tensor.
+        k:         Current iteration index.
+        writer:    SummaryWriter instance.
+        path:      Path for saving images (optional).
+        s:         Current amplitude scale factor.
+        prefix:    Tag prefix for TensorBoard.
+        lpips_fn:  Pre-initialised lpips.LPIPS instance. Created internally if None.
     """
-    loss = nn.MSELoss().to(out_amp.device)
-    loss_value = loss(s * out_amp, target_amp)
-    psnr_value = psnr(target_amp.squeeze().cpu().detach().numpy(), (s * out_amp).squeeze().cpu().detach().numpy())
-    ssim_value = ssim(target_amp.squeeze().cpu().detach().numpy(), (s * out_amp).squeeze().cpu().detach().numpy())
+    device = out_amp.device
 
-    s_min = (target_amp * out_amp).mean() / (out_amp**2).mean()
-    psnr_value_min = psnr(target_amp.squeeze().cpu().detach().numpy(), (s_min * out_amp).squeeze().cpu().detach().numpy())
-    ssim_value_min = ssim(target_amp.squeeze().cpu().detach().numpy(), (s_min * out_amp).squeeze().cpu().detach().numpy())
+    if lpips_fn is None:
+        lpips_fn = lpips.LPIPS(net='alex').to(device)
+
+    loss_mse = nn.MSELoss().to(device)
+    loss_value = loss_mse(s * out_amp, target_amp)
+
+    ssim_value = ssim(
+        target_amp.squeeze().cpu().detach().numpy(),
+        (s * out_amp).squeeze().cpu().detach().numpy(),
+        data_range=1.0
+    )
+
+    # LPIPS — current scale s
+    with torch.no_grad():
+        lpips_value = lpips_fn(
+            _prep_amp_for_lpips(s * out_amp),
+            _prep_amp_for_lpips(target_amp)
+        ).mean().item()
+
+    # LPIPS — least-squares optimal scale s_min
+    s_min = (target_amp * out_amp).mean() / (out_amp ** 2).mean()
+    ssim_value_min = ssim(
+        target_amp.squeeze().cpu().detach().numpy(),
+        (s_min * out_amp).squeeze().cpu().detach().numpy(),
+        data_range=1.0
+    )
+    with torch.no_grad():
+        lpips_value_min = lpips_fn(
+            _prep_amp_for_lpips(s_min * out_amp),
+            _prep_amp_for_lpips(target_amp)
+        ).mean().item()
 
     if writer is not None:
         writer.add_image(f'{prefix}_Recon/amp', (s * out_amp).squeeze(0), k)
         writer.add_scalar(f'{prefix}_loss', loss_value, k)
-        writer.add_scalar(f'{prefix}_psnr', psnr_value, k)
+        writer.add_scalar(f'{prefix}_lpips', lpips_value, k)
         writer.add_scalar(f'{prefix}_ssim', ssim_value, k)
-
-        writer.add_scalar(f'{prefix}_psnr/scaled', psnr_value_min, k)
+        writer.add_scalar(f'{prefix}_lpips/scaled', lpips_value_min, k)
         writer.add_scalar(f'{prefix}_ssim/scaled', ssim_value_min, k)
-
         writer.add_scalar(f'{prefix}_scalar', s, k)
 
 
-def write_gs_summary(slm_field, recon_field, target_amp, k, writer, roi=(880, 1600), prefix='test'):
-    """tensorboard summary for GS"""
-    slm_phase = slm_field.angle()
-    recon_amp, recon_phase = recon_field.abs(), recon_field.angle()
-    loss = nn.MSELoss().to(recon_amp.device)
+def write_gs_summary(slm_field, recon_field, target_amp, k, writer,
+                     roi=(880, 1600), prefix='test', lpips_fn=None):
+    """TensorBoard summary for GS. Uses LPIPS instead of PSNR."""
+    recon_amp = recon_field.abs()
+    device = recon_amp.device
+
+    if lpips_fn is None:
+        lpips_fn = lpips.LPIPS(net='alex').to(device)
+
+    loss_mse = nn.MSELoss().to(device)
 
     recon_amp = crop_image(recon_amp, target_shape=roi, stacked_complex=False)
     target_amp = crop_image(target_amp, target_shape=roi, stacked_complex=False)
@@ -418,45 +425,85 @@ def write_gs_summary(slm_field, recon_field, target_amp, k, writer, roi=(880, 16
     recon_amp *= (torch.sum(recon_amp * target_amp, (-2, -1), keepdim=True)
                   / torch.sum(recon_amp * recon_amp, (-2, -1), keepdim=True))
 
-    loss_value = loss(recon_amp, target_amp)
-    psnr_value = psnr(target_amp.squeeze().cpu().detach().numpy(), recon_amp.squeeze().cpu().detach().numpy())
-    ssim_value = ssim(target_amp.squeeze().cpu().detach().numpy(), recon_amp.squeeze().cpu().detach().numpy())
+    loss_value = loss_mse(recon_amp, target_amp)
+
+    ssim_value = ssim(
+        target_amp.squeeze().cpu().detach().numpy(),
+        recon_amp.squeeze().cpu().detach().numpy(),
+        data_range=1.0
+    )
+
+    with torch.no_grad():
+        lpips_value = lpips_fn(
+            _prep_amp_for_lpips(recon_amp),
+            _prep_amp_for_lpips(target_amp)
+        ).mean().item()
 
     if writer is not None:
         writer.add_image(f'{prefix}_Recon/amp', recon_amp.squeeze(0), k)
         writer.add_scalar(f'{prefix}_loss', loss_value, k)
-        writer.add_scalar(f'{prefix}_psnr', psnr_value, k)
+        writer.add_scalar(f'{prefix}_lpips', lpips_value, k)
         writer.add_scalar(f'{prefix}_ssim', ssim_value, k)
 
 
-def get_psnr_ssim(recon_amp, target_amp, multichannel=False):
-    """get PSNR and SSIM metrics"""
-    psnrs, ssims = {}, {}
+# ---------------------------------------------------------------------------
+# Evaluation metric: LPIPS + SSIM across three colour-space domains
+# ---------------------------------------------------------------------------
 
-    # amplitude
-    psnrs['amp'] = psnr(target_amp, recon_amp)
-    ssims['amp'] = ssim(target_amp, recon_amp, multichannel=multichannel)
+def get_lpips_ssim(recon_amp, target_amp, lpips_fn=None, device='cpu', multichannel=False):
+    """Compute LPIPS and SSIM across amplitude, linear, and sRGB domains.
 
-    # linear
-    target_linear = target_amp**2
-    recon_linear = recon_amp**2
-    psnrs['lin'] = psnr(target_linear, recon_linear)
-    ssims['lin'] = ssim(target_linear, recon_linear, multichannel=multichannel)
+    Replaces the original get_psnr_ssim(). LPIPS is a *distance* — lower is better.
 
-    # srgb
+    Args:
+        recon_amp:   Numpy array, reconstructed amplitude in [0, 1].
+        target_amp:  Numpy array, reference amplitude in [0, 1].
+        lpips_fn:    Pre-initialised lpips.LPIPS instance (optional).
+        device:      Torch device string, used when lpips_fn is None.
+        multichannel: Passed to skimage SSIM for RGB images.
+
+    Returns:
+        lpips_vals: dict with keys 'amp', 'lin', 'srgb'  (lower = better)
+        ssims:      dict with keys 'amp', 'lin', 'srgb'  (higher = better)
+    """
+    if lpips_fn is None:
+        lpips_fn = lpips.LPIPS(net='alex').to(device)
+
+    lpips_vals, ssims = {}, {}
+
+    def _lpips(tgt_np, rec_np):
+        t = _numpy_to_lpips_tensor(tgt_np, device)
+        r = _numpy_to_lpips_tensor(rec_np, device)
+        with torch.no_grad():
+            return lpips_fn(r, t).mean().item()
+
+    # Amplitude domain
+    lpips_vals['amp'] = _lpips(target_amp, recon_amp)
+    ssims['amp'] = ssim(target_amp, recon_amp, multichannel=multichannel, data_range=1.0
+)
+
+    # Linear (intensity) domain
+    target_linear = target_amp ** 2
+    recon_linear = recon_amp ** 2
+    lpips_vals['lin'] = _lpips(target_linear, recon_linear)
+    ssims['lin'] = ssim(target_linear, recon_linear, multichannel=multichannel, data_range=1.0
+)
+
+    # sRGB (gamma-corrected) domain
     target_srgb = srgb_lin2gamma(np.clip(target_linear, 0.0, 1.0))
     recon_srgb = srgb_lin2gamma(np.clip(recon_linear, 0.0, 1.0))
-    psnrs['srgb'] = psnr(target_srgb, recon_srgb)
-    ssims['srgb'] = ssim(target_srgb, recon_srgb, multichannel=multichannel)
+    lpips_vals['srgb'] = _lpips(target_srgb, recon_srgb)
+    ssims['srgb'] = ssim(target_srgb, recon_srgb, multichannel=multichannel, data_range=1.0
+)
 
-    return psnrs, ssims
+    return lpips_vals, ssims
 
+
+# ---------------------------------------------------------------------------
+# Remaining utilities (unchanged from original)
+# ---------------------------------------------------------------------------
 
 def str2bool(v):
-    """ Simple query parser for configArgParse (which doesn't support native bool from cmd)
-    Ref: https://stackoverflow.com/questions/15008758/parsing-boolean-values-with-argparse
-
-    """
     if isinstance(v, bool):
         return v
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
@@ -468,44 +515,24 @@ def str2bool(v):
 
 
 def make_kernel_gaussian(sigma, kernel_size):
-
-    # Create a x, y coordinate grid of shape (kernel_size, kernel_size, 2)
     x_cord = torch.arange(kernel_size)
     x_grid = x_cord.repeat(kernel_size).view(kernel_size, kernel_size)
     y_grid = x_grid.t()
     xy_grid = torch.stack([x_grid, y_grid], dim=-1)
 
     mean = (kernel_size - 1) / 2
-    variance = sigma**2
+    variance = sigma ** 2
 
-    # Calculate the 2-dimensional gaussian kernel which is
-    # the product of two gaussian distributions for two different
-    # variables (in this case called x and y)
     gaussian_kernel = ((1 / (2 * math.pi * variance))
-                       * torch.exp(-torch.sum((xy_grid - mean)**2., dim=-1)
+                       * torch.exp(-torch.sum((xy_grid - mean) ** 2., dim=-1)
                                    / (2 * variance)))
-    # Make sure sum of values in gaussian kernel equals 1.
     gaussian_kernel = gaussian_kernel / torch.sum(gaussian_kernel)
-
-    # Reshape to 2d depthwise convolutional weight
     gaussian_kernel = gaussian_kernel.view(1, 1, kernel_size, kernel_size)
-
     return gaussian_kernel
 
 
 def quantized_phase(phasemap):
-    """
-    just quantize phase into 8bit and return a tensor with the same dtype
-    :param phasemap:
-    :return:
-    """
-
-    # Shift to [0 1]
     phasemap = (phasemap + np.pi) / (2 * np.pi)
-
-    # Convert into integer and take rounding
     phasemap = torch.round(255 * phasemap)
-
-    # Shift to original range
     phasemap = phasemap / 255 * 2 * np.pi - np.pi
     return phasemap

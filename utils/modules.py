@@ -1,430 +1,272 @@
 """
-Some modules for easy use. (No need to calculate kernels explicitly)
+Neural Holography - utils/modules.py  (patched for local hardware)
 
+This file replaces the original neural-holography modules.py.
+PhysicalProp has been rewritten to use:
+  - OpenCV fullscreen window on a secondary monitor (SLM)
+  - Basler camera via pypylon
+
+SGD / GS / DPAC are forwarded from the original modules file.
+
+SETUP (one-time):
+  Before copying this overlay file over the original, rename the original:
+      cp utils/modules.py utils/_modules_orig.py
+  Then copy this file in place.
+
+Original paper:
+Y. Peng, S. Choi, N. Padmanaban, G. Wetzstein.
+Neural Holography with Camera-in-the-loop Training.
+ACM TOG (SIGGRAPH Asia), 2020.
+
+This code is released under CC BY-NC 4.0. Non-commercial use only.
 """
+
+import time
+import numpy as np
 import torch
 import torch.nn as nn
-from algorithms import gerchberg_saxton, stochastic_gradient_descent, double_phase_amplitude_coding
+import cv2
 
-import os
-import time
-import skimage.io
-import utils.utils as utils
-import platform
-my_os = platform.system()
-if my_os == 'Windows':
-    from utils.arduino_laser_control_module import ArduinoLaserControl
-    from utils.camera_capture_module import CameraCapture
-    from utils.calibration_module import Calibration
-    from utils.slm_display_module import SLMDisplay
+from utils.slm_display_module import SLMDisplay
+from utils.camera_capture_module import BaslerCamera
 
 
-class GS(nn.Module):
-    """Classical Gerchberg-Saxton algorithm
+# ---------------------------------------------------------------------------
+# Forward SGD / GS / DPAC from the original neural-holography modules
+# ---------------------------------------------------------------------------
+try:
+    from utils._modules_orig import SGD, GS, DPAC  # type: ignore
+except ImportError:
 
-    Class initialization parameters
-    -------------------------------
-    :param prop_dist: propagation dist between SLM and target, in meters
-    :param wavelength: the wavelength of interest, in meters
-    :param feature_size: the SLM pixel pitch, in meters
-    :param num_iters: the number of iteration, default 500
-    :param phase_path: path to write intermediate results
-    :param loss: loss function, default L2
-    :param prop_model: chooses the propagation operator ('ASM': propagation_ASM,
-        'model': calibrated model). Default 'ASM'.
-    :param propagator: propagator instance (function / pytorch module)
-    :param device: torch.device
+    class _OrigMissing:
+        """Raised at runtime when the original modules are not available."""
 
-    Usage
-    -----
-    Functions as a pytorch module:
+        def __init__(self, cls_name: str):
+            self._cls_name = cls_name
 
-    >>> gs = GS(...)
-    >>> final_phase = gs(target_amp, init_phase)
+        def __call__(self, *args, **kwargs):
+            raise ImportError(
+                f"'{self._cls_name}' requires the original neural-holography "
+                "modules.py.\n"
+                "Rename it to '_modules_orig.py' before copying this overlay:\n"
+                "    cp utils/modules.py utils/_modules_orig.py\n"
+                "Then recopy this file into utils/modules.py."
+            )
 
-    target_amp: amplitude at the target plane, with dimensions [batch, 1, height, width]
-    init_phase: initial guess of phase of phase-only slm
-    final_phase: optimized phase-only representation at SLM plane, same dimensions
-    """
-    def __init__(self, prop_dist, wavelength, feature_size, num_iters, phase_path=None,
-                 prop_model='ASM', propagator=None, writer=None, device=torch.device('cuda')):
-        super(GS, self).__init__()
-
-        # Setting parameters
-        self.prop_dist = prop_dist
-        self.wavelength = wavelength
-        self.feature_size = feature_size
-        self.phase_path = phase_path
-        self.precomputed_H_f = None
-        self.precomputed_H_b = None
-        self.prop_model = prop_model
-        self.prop = propagator
-        self.num_iters = num_iters
-        self.writer = writer
-        self.dev = device
-
-    def forward(self, target_amp, init_phase=None):
-        # Pre-compute propagataion kernel only once
-        if self.precomputed_H_f is None and self.prop_model == 'ASM':
-            self.precomputed_H_f = self.prop(torch.empty(*init_phase.shape, dtype=torch.complex64), self.feature_size,
-                                             self.wavelength, self.prop_dist, return_H=True)
-            self.precomputed_H_f = self.precomputed_H_f.to(self.dev).detach()
-            self.precomputed_H_f.requires_grad = False
-
-        if self.precomputed_H_b is None and self.prop_model == 'ASM':
-            self.precomputed_H_b = self.prop(torch.empty(*init_phase.shape, dtype=torch.complex64), self.feature_size,
-                                             self.wavelength, -self.prop_dist, return_H=True)
-            self.precomputed_H_b = self.precomputed_H_b.to(self.dev).detach()
-            self.precomputed_H_b.requires_grad = False
-
-        # Run algorithm
-        final_phase = gerchberg_saxton(init_phase, target_amp, self.num_iters, self.prop_dist,
-                                       self.wavelength, self.feature_size,
-                                       phase_path=self.phase_path,
-                                       prop_model=self.prop_model, propagator=self.prop,
-                                       precomputed_H_f=self.precomputed_H_f, precomputed_H_b=self.precomputed_H_b,
-                                       writer=self.writer)
-        return final_phase
-
-    @property
-    def phase_path(self):
-        return self._phase_path
-
-    @phase_path.setter
-    def phase_path(self, phase_path):
-        self._phase_path = phase_path
+    SGD  = _OrigMissing("SGD")   # type: ignore
+    GS   = _OrigMissing("GS")    # type: ignore
+    DPAC = _OrigMissing("DPAC")  # type: ignore
 
 
-class SGD(nn.Module):
-    """Proposed Stochastic Gradient Descent Algorithm using Auto-diff Function of PyTorch
+# ---------------------------------------------------------------------------
+# Dummy ALC — no-op stub so callers can do camera_prop.alc.disconnect()
+# ---------------------------------------------------------------------------
 
-    Class initialization parameters
-    -------------------------------
-    :param prop_dist: propagation dist between SLM and target, in meters
-    :param wavelength: the wavelength of interest, in meters
-    :param feature_size: the SLM pixel pitch, in meters
-    :param num_iters: the number of iteration, default 500
-    :param roi_res: region of interest to penalize the loss
-    :param phase_path: path to write intermediate results
-    :param loss: loss function, default L2
-    :param prop_model: chooses the propagation operator ('ASM': propagation_ASM,
-        'model': calibrated model). Default 'ASM'.
-    :param propagator: propagator instance (function / pytorch module)
-    :param lr: learning rate for phase variables
-    :param lr_s: learning rate for the learnable scale
-    :param s0: initial scale
-    :param writer: SummaryWrite instance for tensorboard
-    :param device: torch.device
+class _DummyALC:
+    """No-op stub replacing the Arduino Laser Controller."""
 
-    Usage
-    -----
-    Functions as a pytorch module:
-
-    >>> sgd = SGD(...)
-    >>> final_phase = sgd(target_amp, init_phase)
-
-    target_amp: amplitude at the target plane, with dimensions [batch, 1, height, width]
-    init_phase: initial guess of phase of phase-only slm
-    final_phase: optimized phase-only representation at SLM plane, same dimensions
-    """
-    def __init__(self, prop_dist, wavelength, feature_size, num_iters, roi_res, phase_path=None, prop_model='ASM',
-                 propagator=None, loss=nn.MSELoss(), lr=0.01, lr_s=0.003, s0=1.0, citl=False, camera_prop=None,
-                 writer=None, device=torch.device('cuda')):
-        super(SGD, self).__init__()
-
-        # Setting parameters
-        self.prop_dist = prop_dist
-        self.wavelength = wavelength
-        self.feature_size = feature_size
-        self.roi_res = roi_res
-        self.phase_path = phase_path
-        self.precomputed_H = None
-        self.prop_model = prop_model
-        self.prop = propagator
-
-        self.num_iters = num_iters
-        self.lr = lr
-        self.lr_s = lr_s
-        self.init_scale = s0
-
-        self.citl = citl
-        self.camera_prop = camera_prop
-
-        self.writer = writer
-        self.dev = device
-        self.loss = loss.to(device)
-
-    def forward(self, target_amp, init_phase=None):
-        # Pre-compute propagataion kernel only once
-        if self.precomputed_H is None and self.prop_model == 'ASM':
-            self.precomputed_H = self.prop(torch.empty(*init_phase.shape, dtype=torch.complex64), self.feature_size,
-                                           self.wavelength, self.prop_dist, return_H=True)
-            self.precomputed_H = self.precomputed_H.to(self.dev).detach()
-            self.precomputed_H.requires_grad = False
-
-        # Run algorithm
-        final_phase = stochastic_gradient_descent(init_phase, target_amp, self.num_iters, self.prop_dist,
-                                                  self.wavelength, self.feature_size,
-                                                  roi_res=self.roi_res, phase_path=self.phase_path,
-                                                  prop_model=self.prop_model, propagator=self.prop,
-                                                  loss=self.loss, lr=self.lr, lr_s=self.lr_s, s0=self.init_scale,
-                                                  citl=self.citl, camera_prop=self.camera_prop,
-                                                  writer=self.writer,
-                                                  precomputed_H=self.precomputed_H)
-        return final_phase
-
-    @property
-    def init_scale(self):
-        return self._init_scale
-
-    @init_scale.setter
-    def init_scale(self, s):
-        self._init_scale = s
-
-    @property
-    def citl_hardwares(self):
-        return self._citl_hardwares
-
-    @citl_hardwares.setter
-    def citl_hardwares(self, citl_hardwares):
-        self._citl_hardwares = citl_hardwares
-
-    @property
-    def phase_path(self):
-        return self._phase_path
-
-    @phase_path.setter
-    def phase_path(self, phase_path):
-        self._phase_path = phase_path
-
-    @property
-    def prop(self):
-        return self._prop
-
-    @prop.setter
-    def prop(self, prop):
-        self._prop = prop
+    def disconnect(self) -> None:
+        pass
 
 
-class DPAC(nn.Module):
-    """Double-phase Amplitude Coding
-
-    Class initialization parameters
-    -------------------------------
-    :param prop_dist: propagation dist between SLM and target, in meters
-    :param wavelength: the wavelength of interest, in meters
-    :param feature_size: the SLM pixel pitch, in meters
-    :param prop_model: chooses the propagation operator ('ASM': propagation_ASM,
-        'model': calibrated model). Default 'ASM'.
-    :param propagator: propagator instance (function / pytorch module)
-    :param device: torch.device
-
-    Usage
-    -----
-    Functions as a pytorch module:
-
-    >>> dpac = DPAC(...)
-    >>> _, final_phase = dpac(target_amp, target_phase)
-
-    target_amp: amplitude at the target plane, with dimensions [batch, 1, height, width]
-    target_amp (optional): phase at the target plane, with dimensions [batch, 1, height, width]
-    final_phase: optimized phase-only representation at SLM plane, same dimensions
-
-    """
-    def __init__(self, prop_dist, wavelength, feature_size, prop_model='ASM', propagator=None,
-                 device=torch.device('cuda')):
-        """
-
-        """
-        super(DPAC, self).__init__()
-
-        # propagation is from target to SLM plane (one step)
-        self.prop_dist = -prop_dist
-        self.wavelength = wavelength
-        self.feature_size = feature_size
-        self.precomputed_H = None
-        self.prop_model = prop_model
-        self.prop = propagator
-        self.dev = device
-
-    def forward(self, target_amp, target_phase=None):
-        if target_phase is None:
-            target_phase = torch.zeros_like(target_amp)
-
-        if self.precomputed_H is None and self.prop_model == 'ASM':
-            self.precomputed_H = self.prop(torch.empty(*target_amp.shape, dtype=torch.complex64), self.feature_size,
-                                           self.wavelength, self.prop_dist, return_H=True)
-            self.precomputed_H = self.precomputed_H.to(self.dev).detach()
-            self.precomputed_H.requires_grad = False
-
-        final_phase = double_phase_amplitude_coding(target_phase, target_amp, self.prop_dist,
-                                                    self.wavelength, self.feature_size,
-                                                    prop_model=self.prop_model, propagator=self.prop,
-                                                    precomputed_H=self.precomputed_H)
-        return None, final_phase
-
-    @property
-    def phase_path(self):
-        return self._phase_path
-
-    @phase_path.setter
-    def phase_path(self, phase_path):
-        self._phase_path = phase_path
-
-
+# ---------------------------------------------------------------------------
+# PhysicalProp
+# ---------------------------------------------------------------------------
 
 class PhysicalProp(nn.Module):
-    """ A module for physical propagation,
-    forward pass displays gets SLM pattern as an input and display the pattern on the physical setup,
-    and capture the diffraction image at the target plane,
-    and then return warped image using pre-calibrated homography from instantiation.
+    """Physical wave propagation via SLM + Basler camera.
 
-    Class initialization parameters
-    -------------------------------
-    :param channel:
-    :param slm_settle_time:
-    :param roi_res: *** Note that the order of x / y is reversed here ***
-    :param num_circles:
-    :param laser_arduino:
-    :param com_port:
-    :param arduino_port_num:
-    :param range_row:
-    :param range_col:
-    :param patterns_path:
-    :param calibration_preview:
+    Displays a phase pattern on an SLM (OpenCV window, secondary monitor),
+    waits for the SLM to settle, captures an image with a Basler camera,
+    applies a pre-computed homography, and returns the result as a
+    PyTorch amplitude tensor.
 
-    Usage
-    -----
-    Functions as a pytorch module:
+    --------------------------------------------------------------------------
+    Coordinate conventions
+    --------------------------------------------------------------------------
+    Input  slm_phase  : (1, 1, H_slm, W_slm) float32 in [-π, π]
+    Output amplitude  : (1, 1, H_roi, W_roi) float32 in [0, 1]
+                        = sqrt(normalised intensity)
 
-    >>> camera_prop = PhysicalProp(...)
-    >>> captured_amp = camera_prop(slm_phase)
+    --------------------------------------------------------------------------
+    Args
+    --------------------------------------------------------------------------
+    channel         : Colour channel (0=red, 1=green, 2=blue). Stored for
+                      reference; not used internally.
+    slm_settle_time : Seconds to wait after SLM update before capture.
+    roi_res         : (width, height) of the output ROI in pixels.  If a
+                      homography is supplied this is the warpPerspective
+                      output size; otherwise the camera frame is resized.
+    homography_file : Path to a .npy file containing the 3×3 homography
+                      matrix H (maps camera pixels → target plane).
+                      Pass '' or None to skip homography.
+    homography_matrix: 3×3 array-like to use instead of homography_file.
+    slm_flip_udlr   : Flip SLM image 180° before display (for upside-down
+                      mounting). Default True.
+    show_preview    : Show the captured (warped) frame in an OpenCV window.
+    camera_index    : Basler device index (0 = first camera found).
+    pixel_format    : Basler pixel format ('RGB8', 'BGR8', 'Mono8').
+    slm_res         : (width, height) of the SLM, default 1920×1080.
+    monitor_index   : Target monitor index for the SLM window
+                      (1 = second monitor, 0 = primary). Default 1.
 
-    slm_phase: phase at the SLM plane, with dimensions [batch, 1, height, width]
-    captured_amp: amplitude at the target plane, with dimensions [batch, 1, height, width]
-
+    Legacy keyword args accepted for API compatibility but ignored:
+    laser_arduino, range_row, range_col, patterns_path
     """
-    def __init__(self, channel=1, slm_settle_time=0.1, roi_res=(1600, 880), num_circles=(21, 12),
-                 laser_arduino=False, com_port='COM3', arduino_port_num=(6, 10, 11),
-                 range_row=(200, 1000), range_col=(300, 1700),
-                 patterns_path=f'F:/citl/calibration', show_preview=False):
-        super(PhysicalProp, self).__init__()
 
-        # 1. Connect Camera
-        self.camera = CameraCapture()
-        self.camera.connect(0)  # specify the camera to use, 0 for main cam, 1 for the second cam
+    def __init__(self,
+                 channel: int = 1,
+                 slm_settle_time: float = 0.3,
+                 roi_res: tuple = (1600, 880),
+                 homography_file: str = '',
+                 homography_matrix=None,
+                 slm_flip_udlr: bool = True,
+                 show_preview: bool = False,
+                 camera_index: int = 0,
+                 pixel_format: str = 'RGB8',
+                 slm_res: tuple = (1920, 1080),
+                 monitor_index: int = 1,
+                 # --- legacy args (ignored) ---
+                 laser_arduino: bool = False,
+                 range_row=None,
+                 range_col=None,
+                 patterns_path: str = '',
+                 **kwargs):
+        super().__init__()
 
-        # 2. Connect SLM
-        self.slm = SLMDisplay()
-        self.slm.connect()
+        self.channel = channel
         self.slm_settle_time = slm_settle_time
+        self.roi_res = roi_res          # (W, H)
+        self.show_preview = show_preview
 
-        # 3. Connect to the Arduino that switches rgb color through the laser control box.
-        if laser_arduino:
-            self.alc = ArduinoLaserControl(com_port, arduino_port_num)
-            self.alc.switch_control_box(channel)
+        # Homography
+        self.H = self._load_homography(homography_file, homography_matrix)
+        if self.H is not None:
+            print(f"[PhysicalProp] homography loaded, output ROI = {roi_res}")
         else:
-            self.alc = None
+            print(f"[PhysicalProp] no homography — camera frame will be resized "
+                  f"to {roi_res}")
 
-        # 4. Calibrate hardwares using homography
-        calib_ptrn_path = os.path.join(patterns_path, f'{("red", "green", "blue")[channel]}.png')
-        space_btw_circs = [int(roi / (num_circs - 1)) for roi, num_circs in zip(roi_res, num_circles)]
+        # Hardware
+        self._slm = SLMDisplay(
+            slm_flip_udlr=slm_flip_udlr,
+            monitor_index=monitor_index,
+            slm_res=slm_res,
+        )
+        self._cam = BaslerCamera(
+            camera_index=camera_index,
+            pixel_format=pixel_format,
+        )
 
-        self.calibrate(calib_ptrn_path, num_circles, space_btw_circs,
-                       range_row=range_row, range_col=range_col, show_preview=show_preview)
+        # Compatibility stub (caller may do camera_prop.alc.disconnect())
+        self.alc = _DummyALC()
 
-    def calibrate(self, calibration_pattern_path, num_circles, space_btw_circs,
-                  range_row, range_col, show_preview=False, num_grab_images=10):
+        if show_preview:
+            cv2.namedWindow("PhysicalProp Preview", cv2.WINDOW_NORMAL)
+
+    # ------------------------------------------------------------------
+    # nn.Module forward
+    # ------------------------------------------------------------------
+
+    def forward(self, slm_phase: torch.Tensor) -> torch.Tensor:
+        """Display phase, capture, warp, return amplitude tensor.
+
+        Args:
+            slm_phase : (1, 1, H_slm, W_slm) float32 phase in [-π, π].
+
+        Returns:
+            (1, 1, H_roi, W_roi) float32 amplitude in [0, 1].
         """
-        pre-calculate the homography between target plane and the camera captured plane
+        # ── 1. Phase [-π, π]  →  uint8 [0, 255] ──────────────────────────
+        phase_np = slm_phase.detach().squeeze().cpu().numpy()   # (H, W)
+        phase_u8 = (
+            (phase_np + np.pi) / (2.0 * np.pi) * 255.0
+        ).clip(0, 255).round().astype(np.uint8)
 
-        :param calibration_pattern_path:
-        :param num_circles:
-        :param space_btw_circs: number of pixels between circles
-        :param slm_settle_time:
-        :param range_row:
-        :param range_col:
-        :param show_preview:
-        :param num_grab_images:
-        :return:
-        """
+        # ── 2. Display on SLM ────────────────────────────────────────────
+        self._slm.display(phase_u8)
 
-        self.calibrator = Calibration(num_circles, space_btw_circs)
-
-        # supposed to be a grid pattern image (21 x 12) for calibration
-        calib_phase_img = skimage.io.imread(calibration_pattern_path)
-        self.slm.show_data_from_array(calib_phase_img)
-
-        # sleep for 0.1s
+        # ── 3. Wait for SLM to settle ────────────────────────────────────
         time.sleep(self.slm_settle_time)
 
-        # capture displayed grid pattern image
-        captured_intensities = self.camera.grab_images(num_grab_images)  # capture 5-10 images for averaging
-        captured_img = utils.burst_img_processor(captured_intensities)
+        # ── 4. Capture camera frame (float [0, 1]) ───────────────────────
+        frame = self._cam.grab_gray()   # (H_cam, W_cam) float32
+        if frame is None:
+            raise RuntimeError(
+                "[PhysicalProp] Camera grab failed — check camera connection."
+            )
 
-        # masking out dot pattern region for homography
-        captured_img_masked = captured_img[range_row[0]:range_row[1], range_col[0]:range_col[1], ...]
-        calib_success = self.calibrator.calibrate(captured_img_masked, show_preview=show_preview)
-
-        self.calibrator.start_row, self.calibrator.end_row = range_row
-        self.calibrator.start_col, self.calibrator.end_col = range_col
-
-        if calib_success:
-            print('   - calibration success')
+        # ── 5. Homography warp or simple resize ──────────────────────────
+        w, h = self.roi_res
+        if self.H is not None:
+            frame = cv2.warpPerspective(frame, self.H, (w, h))
         else:
-            raise ValueError('  - Calibration failed')
+            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
 
-    def forward(self, slm_phase, num_grab_images=1):
-        """
-        this forward pass gets slm_phase to display and returns the amplitude image at the target plane.
+        # ── 6. Optional preview window ────────────────────────────────────
+        if self.show_preview:
+            preview_u8 = (frame * 255).clip(0, 255).astype(np.uint8)
+            cv2.imshow("PhysicalProp Preview", preview_u8)
+            cv2.waitKey(1)
 
-        :param slm_phase:
-        :param num_grab_images:
-        :return: A pytorch tensor shape of (1, 1, H, W)
-        """
+        # ── 7. Intensity → amplitude  (camera measures |A|², return |A|) ──
+        amplitude = np.sqrt(np.clip(frame, 0.0, 1.0))
 
-        slm_phase_8bit = utils.phasemap_8bit(slm_phase, True)
+        # ── 8. (1, 1, H_roi, W_roi) float32 tensor ───────────────────────
+        amp_tensor = (
+            torch.from_numpy(amplitude)
+            .float()
+            .unsqueeze(0)   # → (1, H, W)
+            .unsqueeze(0)   # → (1, 1, H, W)
+        )
+        return amp_tensor
 
-        # display the pattern and capture linear intensity, after perspective transform
-        captured_linear_np = self.capture_linear_intensity(slm_phase_8bit, num_grab_images=num_grab_images)
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
 
-        # convert raw-16 linear intensity image into an amplitude tensor
-        if len(captured_linear_np.shape) > 2:
-            captured_linear = torch.tensor(captured_linear_np, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
-            captured_linear = captured_linear.to(slm_phase.device)
-            captured_linear = torch.sum(captured_linear, dim=1, keepdim=True)
-        else:
-            captured_linear = torch.tensor(captured_linear_np, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-            captured_linear = captured_linear.to(slm_phase.device)
+    def disconnect(self) -> None:
+        """Release camera, close SLM window, and destroy preview window."""
+        try:
+            self._cam.close()
+        except Exception:
+            pass
+        try:
+            self._slm.close()
+        except Exception:
+            pass
+        if self.show_preview:
+            try:
+                cv2.destroyWindow("PhysicalProp Preview")
+            except Exception:
+                pass
+        print("[PhysicalProp] disconnected.")
 
-        # return amplitude
-        return torch.sqrt(captured_linear)
+    # ------------------------------------------------------------------
+    # Homography helpers
+    # ------------------------------------------------------------------
 
-    def capture_linear_intensity(self, slm_phase, num_grab_images):
-        """
+    @staticmethod
+    def _load_homography(file_path, matrix):
+        """Load a 3×3 homography from a file or array, return None if absent."""
+        if file_path:
+            H = np.load(file_path)
+            if H.shape != (3, 3):
+                raise ValueError(
+                    f"Homography file must contain a (3,3) array, got {H.shape}"
+                )
+            return H.astype(np.float64)
+        if matrix is not None:
+            H = np.asarray(matrix, dtype=np.float64)
+            if H.shape != (3, 3):
+                raise ValueError(
+                    f"homography_matrix must be shape (3,3), got {H.shape}"
+                )
+            return H
+        return None
 
-        :param slm_phase:
-        :param num_grab_images:
-        :return:
-        """
-
-        # display on SLM and sleep for 0.1s
-        self.slm.show_data_from_array(slm_phase)
-        time.sleep(self.slm_settle_time)
-
-        # capture and take average
-        grabbed_images = self.camera.grab_images(num_grab_images)
-        captured_intensity_raw_avg = utils.burst_img_processor(grabbed_images)  # averaging
-
-        # crop ROI as calibrated
-        captured_intensity_raw_cropped = captured_intensity_raw_avg[
-            self.calibrator.start_row:self.calibrator.end_row,
-            self.calibrator.start_col:self.calibrator.end_col, ...]
-        # apply homography
-        return self.calibrator(captured_intensity_raw_cropped)
-
-    def disconnect(self):
-        self.camera.disconnect()
-        self.slm.disconnect()
-        if self.alc is not None:
-            self.alc.turnOffAll()
+    @staticmethod
+    def save_homography(H: np.ndarray, path: str) -> None:
+        """Save a homography matrix to a .npy file for later reuse."""
+        np.save(path, np.asarray(H, dtype=np.float64))
+        print(f"[PhysicalProp] homography saved → {path}")

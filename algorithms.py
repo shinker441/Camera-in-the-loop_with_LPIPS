@@ -142,8 +142,13 @@ def stochastic_gradient_descent(init_phase, target_amp, num_iters, prop_dist, wa
         recon_amp = utils.crop_image(recon_amp, target_shape=roi_res, stacked_complex=False)
 
         # camera-in-the-loop technique
+        # camera-in-the-loop technique
         if citl:
             captured_amp = camera_prop(slm_phase)
+            if not torch.is_tensor(captured_amp):
+                captured_amp = torch.tensor(captured_amp, device=recon_amp.device, dtype=recon_amp.dtype)
+            else:
+                captured_amp = captured_amp.to(device=recon_amp.device, dtype=recon_amp.dtype)
 
             # use the gradient of proxy, replacing the amplitudes
             # captured_amp is assumed that its size already matches that of recon_amp
