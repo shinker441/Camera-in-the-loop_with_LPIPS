@@ -110,7 +110,10 @@ def stochastic_gradient_descent(init_phase, target_amp, num_iters, prop_dist, wa
     """
 
     device = init_phase.device
-    s = torch.tensor(s0, requires_grad=True, device=device)
+    # s0 may arrive as a scalar tensor (from .mean()); extract the float value to avoid
+    # the "copy construct from tensor" UserWarning and ensure s is a proper leaf variable.
+    s0_val = s0.item() if isinstance(s0, torch.Tensor) else float(s0)
+    s = torch.tensor(s0_val, requires_grad=True, device=device)
 
     # phase at the slm plane
     slm_phase = init_phase.requires_grad_(True)
@@ -162,11 +165,19 @@ def stochastic_gradient_descent(init_phase, target_amp, num_iters, prop_dist, wa
         optimizer.step()
 
         # write to tensorboard / write phase image
-        # Note that it takes 0.~ s for writing it to tensorboard
         with torch.no_grad():
             if k % 50 == 0:
+                # Reuse the LPIPS network from the loss to avoid re-loading weights each call.
+                lpips_fn = getattr(loss, 'lpips_net', None)
                 utils.write_sgd_summary(slm_phase, out_amp, target_amp, k,
-                                        writer=writer, path=phase_path, s=s, prefix='test')
+                                        writer=writer, path=phase_path, s=s, prefix='test',
+                                        lpips_fn=lpips_fn)
+                # Log the actual combined-loss components (MSE + λ×LPIPS) to TensorBoard.
+                if writer is not None and hasattr(loss, 'last_mse') and loss.last_mse is not None:
+                    writer.add_scalar('train_loss/mse',      loss.last_mse.item(),   k)
+                    writer.add_scalar('train_loss/lpips',    loss.last_lpips.item(), k)
+                    writer.add_scalar('train_loss/combined',
+                                      (loss.last_mse + loss.lambda_lpips * loss.last_lpips).item(), k)
 
     return slm_phase
 

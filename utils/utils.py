@@ -368,25 +368,34 @@ def write_sgd_summary(slm_phase, out_amp, target_amp, k,
 
     if lpips_fn is None:
         lpips_fn = lpips.LPIPS(net='alex').to(device)
+    else:
+        # Ensure the passed network is on the same device as the tensors.
+        lpips_fn = lpips_fn.to(device)
+
+    # Ensure s is a plain scalar for arithmetic (avoids device/grad issues).
+    s_val = s.item() if isinstance(s, torch.Tensor) else float(s)
 
     loss_mse = nn.MSELoss().to(device)
-    loss_value = loss_mse(s * out_amp, target_amp)
+    loss_value = loss_mse(s_val * out_amp, target_amp)
+
+    scaled_amp = (s_val * out_amp).detach()
 
     ssim_value = ssim(
         target_amp.squeeze().cpu().detach().numpy(),
-        (s * out_amp).squeeze().cpu().detach().numpy(),
+        scaled_amp.squeeze().cpu().numpy(),
         data_range=1.0
     )
 
     # LPIPS — current scale s
     with torch.no_grad():
         lpips_value = lpips_fn(
-            _prep_amp_for_lpips(s * out_amp),
+            _prep_amp_for_lpips(scaled_amp),
             _prep_amp_for_lpips(target_amp)
         ).mean().item()
 
     # LPIPS — least-squares optimal scale s_min
-    s_min = (target_amp * out_amp).mean() / (out_amp ** 2).mean()
+    with torch.no_grad():
+        s_min = (target_amp * out_amp).mean() / (out_amp ** 2).mean()
     ssim_value_min = ssim(
         target_amp.squeeze().cpu().detach().numpy(),
         (s_min * out_amp).squeeze().cpu().detach().numpy(),
@@ -399,13 +408,13 @@ def write_sgd_summary(slm_phase, out_amp, target_amp, k,
         ).mean().item()
 
     if writer is not None:
-        writer.add_image(f'{prefix}_Recon/amp', (s * out_amp).squeeze(0), k)
+        writer.add_image(f'{prefix}_Recon/amp', scaled_amp.squeeze(0), k)
         writer.add_scalar(f'{prefix}_loss', loss_value, k)
         writer.add_scalar(f'{prefix}_lpips', lpips_value, k)
         writer.add_scalar(f'{prefix}_ssim', ssim_value, k)
         writer.add_scalar(f'{prefix}_lpips/scaled', lpips_value_min, k)
         writer.add_scalar(f'{prefix}_ssim/scaled', ssim_value_min, k)
-        writer.add_scalar(f'{prefix}_scalar', s, k)
+        writer.add_scalar(f'{prefix}_scalar', s_val, k)
 
 
 def write_gs_summary(slm_field, recon_field, target_amp, k, writer,

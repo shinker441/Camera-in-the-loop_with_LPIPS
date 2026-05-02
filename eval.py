@@ -90,8 +90,12 @@ precomputed_H = [None] * 3
 if opt.prop_model == 'ASM':
     propagator = propagation_ASM
     for c in chs:
-        precomputed_H[c] = propagator(torch.empty(1, 1, *slm_res, 2), feature_size,
-                                      wavelengths[c], prop_dists[c], return_H=True).to(device)
+        # Use native complex64 tensor (not the old 5-D stacked format) so that
+        # propagation_ASM computes H with the correct spatial dimensions.
+        precomputed_H[c] = propagator(
+            torch.empty(1, 1, *slm_res, dtype=torch.complex64),
+            feature_size, wavelengths[c], prop_dists[c], return_H=True
+        ).to(device)
 
 elif opt.prop_model.upper() == 'CAMERA':
     propagator = PhysicalProp(channel, laser_arduino=True, roi_res=(roi_res[1], roi_res[0]),
@@ -167,7 +171,8 @@ for k, target in enumerate(image_loader):
         if opt.prop_model.upper() == 'MODEL':
             propagator = propagators[c]
         recon_field = utils.propagate_field(slm_field, propagator, prop_dists[c], wavelengths[c],
-                                            feature_size, opt.prop_model, dtype)
+                                            feature_size, opt.prop_model, dtype,
+                                            precomputed_H=precomputed_H[c])
 
         recon_amp_c = recon_field.abs()
         recon_amp_c = utils.crop_image(recon_amp_c, target_shape=roi_res, stacked_complex=False)
