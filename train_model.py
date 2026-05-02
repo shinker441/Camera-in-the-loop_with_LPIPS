@@ -269,12 +269,15 @@ for e in range(opt.num_epochs):
             optimizer_phase.step()
             optimizer_phase_scale.step()
 
-        # Write updated phases to disk (phase pool)
+        # Write updated phases back to the channel sub-directory so they are
+        # picked up correctly on the next load (same path used when reading).
         with torch.no_grad():
+            chan_dir = os.path.join(phase_path, chan_str)
+            utils.cond_mkdir(chan_dir)
             for k, idx in enumerate(idxs):
                 phase_out_8bit = utils.phasemap_8bit(
                     slm_phases[k, np.newaxis, ...].cpu().detach(), inverted=True)
-                cv2.imwrite(os.path.join(phase_path, f'{idx}.png'), phase_out_8bit)
+                cv2.imwrite(os.path.join(chan_dir, f'{idx}.png'), phase_out_8bit)
 
         # Quantise phases to 8-bit as displayed on SLM
         slm_phases = utils.quantized_phase(slm_phases)
@@ -305,24 +308,23 @@ for e in range(opt.num_epochs):
         # ── TensorBoard logging ───────────────────────────────────────────────
         with torch.no_grad():
             if i % 50 == 0:
-                writer.add_scalar('Scale/sa', sa, i_acc)
-                writer.add_scalar('Scale/sb', sb, i_acc)
+                writer.add_scalar('Scale/sa', sa.item(), i_acc)
+                writer.add_scalar('Scale/sb', sb.item(), i_acc)
                 for idx_s in range(opt.batch_size):
-                    writer.add_scalar(f'Scale/model_vs_target_{idx_s}', scale_phase[idx_s], i_acc)
+                    writer.add_scalar(f'Scale/model_vs_target_{idx_s}',
+                                      scale_phase[idx_s].item(), i_acc)
                 # Phase loss components
-                writer.add_scalar('Loss/phase_total',  loss_value_phase,       i_acc)
-                writer.add_scalar('Loss/phase_mse',    loss_phase.last_mse,    i_acc)
-                writer.add_scalar('Loss/phase_lpips',  loss_phase.last_lpips,  i_acc)
+                writer.add_scalar('Loss/phase_total',  loss_value_phase.item(),      i_acc)
+                writer.add_scalar('Loss/phase_mse',    loss_phase.last_mse.item(),   i_acc)
+                writer.add_scalar('Loss/phase_lpips',  loss_phase.last_lpips.item(), i_acc)
                 # Model loss components
-                writer.add_scalar('Loss/model_total',  loss_value_model,       i_acc)
-                writer.add_scalar('Loss/model_mse',    loss_model.last_mse,    i_acc)
-                writer.add_scalar('Loss/model_lpips',  loss_model.last_lpips,  i_acc)
+                writer.add_scalar('Loss/model_total',  loss_value_model.item(),      i_acc)
+                writer.add_scalar('Loss/model_mse',    loss_model.last_mse.item(),   i_acc)
+                writer.add_scalar('Loss/model_lpips',  loss_model.last_lpips.item(), i_acc)
                 # Reference MSE between camera and target (for monitoring)
-                writer.add_scalar(
-                    'Loss/camera_vs_target_mse',
-                    loss_mse(camera_amp * target_amp.mean() / camera_amp.mean(), target_amp),
-                    i_acc
-                )
+                cam_scaled = camera_amp * target_amp.mean() / camera_amp.mean()
+                writer.add_scalar('Loss/camera_vs_target_mse',
+                                  loss_mse(cam_scaled, target_amp).item(), i_acc)
 
             if i % 50 == 0:
                 recon    = model_amp[0, ...]
