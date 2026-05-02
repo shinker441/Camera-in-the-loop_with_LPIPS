@@ -4,6 +4,7 @@ Basler camera capture module — pypylon interface.
 Replaces the original FLIR PyCapture2-based camera control in neural-holography.
 """
 
+import time
 import numpy as np
 
 try:
@@ -19,18 +20,18 @@ class BaslerCamera:
     Opens the camera device, configures pixel format and resolution, and
     provides grab helpers that return NumPy arrays.
 
-    Grab strategy: start-stop per frame.  A fresh StartGrabbing is issued
-    before every grab and StopGrabbing is called immediately after.  This
-    avoids the "buffer was cancelled" error that occurs with persistent
-    LatestImageOnly grabbing when Stage-1 GPU work lets the driver buffer
-    overflow between grabs.
+    Grab strategy: persistent StartGrabbing to keep the USB device active,
+    with automatic stop-restart when the buffer is cancelled (which happens
+    when Stage-1 GPU work lets old frames pile up).  This avoids both:
+      - USB disconnection from idle (occurs with start-stop-per-grab)
+      - "buffer was cancelled" errors (occurs with plain persistent grabbing)
 
     Args:
         camera_index: Device index among enumerated Basler cameras (0 = first).
         pixel_format: Requested pixel format.  Tried in order until one works:
                       the requested format → 'BGR8' → 'Mono8'.
         timeout_ms:   Grab timeout in milliseconds per attempt.
-        num_discard:  Warmup frames to discard on the first grab to let the
+        num_discard:  Warmup frames to discard after StartGrabbing to let the
                       camera reach a stable exposure state.
     """
 
@@ -38,7 +39,7 @@ class BaslerCamera:
                  camera_index: int = 0,
                  pixel_format: str = 'RGB8',
                  timeout_ms: int = 3000,
-                 num_discard: int = 3):
+                 num_discard: int = 5):
         if not _HAVE_PYPYLON:
             raise ImportError(
                 "pypylon is not installed.  "
@@ -47,7 +48,6 @@ class BaslerCamera:
         self.timeout_ms  = timeout_ms
         self.num_discard = num_discard
         self._pixel_format = None
-        self._first_grab   = True   # flag for one-time warmup
         self._cam = self._init_camera(camera_index, pixel_format)
 
     # ------------------------------------------------------------------
@@ -82,58 +82,77 @@ class BaslerCamera:
         cam.Width.Value  = cam.Width.Max
         cam.Height.Value = cam.Height.Max
 
+        # Start grabbing immediately to keep the USB device active.
+        cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+
+        # Discard warmup frames so the camera reaches stable streaming state.
+        for _ in range(self.num_discard):
+            r = cam.RetrieveResult(self.timeout_ms, pylon.TimeoutHandling_Return)
+            if r is not None:
+                r.Release()
+
         print(f"[BaslerCamera] opened device {index}, pixel_format={self._pixel_format}, "
               f"res={cam.Width.Value}×{cam.Height.Value}")
         return cam
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _restart_grabbing(self) -> None:
+        """Stop and restart grabbing to clear a cancelled-buffer state."""
+        try:
+            if self._cam.IsGrabbing():
+                self._cam.StopGrabbing()
+        except Exception:
+            pass
+        time.sleep(0.05)
+        self._cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+        # Discard any stale frames after restart.
+        for _ in range(3):
+            r = self._cam.RetrieveResult(500, pylon.TimeoutHandling_Return)
+            if r is not None:
+                r.Release()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def grab(self) -> np.ndarray:
-        """Grab one frame (start → grab → stop) and return as a NumPy array.
+        """Grab the most recent frame and return as a NumPy array.
 
-        Uses a fresh StartGrabbing/StopGrabbing per call to avoid buffer
-        cancellation errors that occur with persistent grabbing when the
-        camera is idle for extended periods between captures.
+        On buffer-cancellation errors (which occur when the driver queue
+        overflows while the GPU is busy), the grabbing session is restarted
+        and the grab is retried.
 
         Returns BGR uint8 for colour formats, (H, W) uint8 for Mono8.
         Returns None if all attempts fail.
         """
-        self._cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
-        try:
-            # On the first real grab, discard warmup frames.
-            if self._first_grab:
-                for _ in range(self.num_discard):
-                    r = self._cam.RetrieveResult(
-                        self.timeout_ms, pylon.TimeoutHandling_Return
-                    )
-                    if r is not None:
-                        r.Release()
-                self._first_grab = False
+        for attempt in range(4):
+            if not self._cam.IsGrabbing():
+                self._cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
 
-            img = None
-            for attempt in range(3):
-                r = self._cam.RetrieveResult(
-                    self.timeout_ms, pylon.TimeoutHandling_Return
-                )
-                if r is None:
-                    print(f"[BaslerCamera] grab attempt {attempt+1}: timeout")
-                    continue
-                if not r.GrabSucceeded():
-                    print(f"[BaslerCamera] grab attempt {attempt+1}: "
-                          f"ErrorCode={r.ErrorCode}, "
-                          f"ErrorDescription={r.ErrorDescription}")
-                    r.Release()
-                    continue
-                img = r.Array.copy()
+            r = self._cam.RetrieveResult(
+                self.timeout_ms, pylon.TimeoutHandling_Return
+            )
+
+            if r is None:
+                print(f"[BaslerCamera] grab attempt {attempt+1}: timeout")
+                self._restart_grabbing()
+                continue
+
+            if not r.GrabSucceeded():
+                print(f"[BaslerCamera] grab attempt {attempt+1}: "
+                      f"ErrorCode={r.ErrorCode}, "
+                      f"ErrorDescription={r.ErrorDescription}")
                 r.Release()
-                break
+                self._restart_grabbing()
+                continue
 
-        finally:
-            self._cam.StopGrabbing()
-
-        if img is None:
+            img = r.Array.copy()
+            r.Release()
+            break
+        else:
             return None
 
         # pypylon returns RGB8 as (H, W, 3) in RGB order → convert to BGR
