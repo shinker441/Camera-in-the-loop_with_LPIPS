@@ -486,24 +486,25 @@ def get_lpips_ssim(recon_amp, target_amp, lpips_fn=None, device='cpu', multichan
         with torch.no_grad():
             return lpips_fn(r, t).mean().item()
 
+    # scikit-image >= 0.19 uses channel_axis; older versions used multichannel.
+    ssim_kwargs = {'data_range': 1.0,
+                   'channel_axis': -1 if multichannel else None}
+
     # Amplitude domain
     lpips_vals['amp'] = _lpips(target_amp, recon_amp)
-    ssims['amp'] = ssim(target_amp, recon_amp, multichannel=multichannel, data_range=1.0
-)
+    ssims['amp'] = ssim(target_amp, recon_amp, **ssim_kwargs)
 
     # Linear (intensity) domain
     target_linear = target_amp ** 2
     recon_linear = recon_amp ** 2
     lpips_vals['lin'] = _lpips(target_linear, recon_linear)
-    ssims['lin'] = ssim(target_linear, recon_linear, multichannel=multichannel, data_range=1.0
-)
+    ssims['lin'] = ssim(target_linear, recon_linear, **ssim_kwargs)
 
     # sRGB (gamma-corrected) domain
     target_srgb = srgb_lin2gamma(np.clip(target_linear, 0.0, 1.0))
     recon_srgb = srgb_lin2gamma(np.clip(recon_linear, 0.0, 1.0))
     lpips_vals['srgb'] = _lpips(target_srgb, recon_srgb)
-    ssims['srgb'] = ssim(target_srgb, recon_srgb, multichannel=multichannel, data_range=1.0
-)
+    ssims['srgb'] = ssim(target_srgb, recon_srgb, **ssim_kwargs)
 
     return lpips_vals, ssims
 
