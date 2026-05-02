@@ -294,7 +294,7 @@ for e in range(opt.num_epochs):
             for k, idx in enumerate(idxs):
                 slm_phase = slm_phases[k, np.newaxis, ...]
                 camera_amp.append(camera_prop(slm_phase))
-            camera_amp = torch.cat(camera_amp, 0)
+            camera_amp = torch.cat(camera_amp, 0).to(device)
 
         # ── Stage 3: Model update ─────────────────────────────────────────────
         model = model.train()
