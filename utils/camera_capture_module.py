@@ -53,6 +53,13 @@ class BaslerCamera:
         )
         cam.Open()
 
+        # Disable external trigger so the camera runs in free-running mode.
+        # Some cameras retain trigger settings from previous sessions.
+        try:
+            cam.TriggerMode.Value = 'Off'
+        except Exception:
+            pass
+
         # Try preferred format, fall back gracefully
         for fmt in (preferred_format, 'BGR8', 'Mono8'):
             try:
@@ -65,6 +72,14 @@ class BaslerCamera:
         cam.Width.Value  = cam.Width.Max
         cam.Height.Value = cam.Height.Max
         cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+
+        # Discard a few warmup frames so the camera reaches a stable streaming
+        # state before the first real grab.
+        for _ in range(5):
+            r = cam.RetrieveResult(3000, pylon.TimeoutHandling_Return)
+            if r is not None:
+                r.Release()
+
         print(f"[BaslerCamera] opened device {index}, pixel_format={self._pixel_format}, "
               f"res={cam.Width.Value}×{cam.Height.Value}")
         return cam
@@ -78,14 +93,23 @@ class BaslerCamera:
 
         - RGB8 frames are converted to BGR for OpenCV compatibility.
         - Mono8 frames are returned as (H, W) uint8.
-        - Returns None if the grab failed or timed out.
+        - Returns None if the grab failed or timed out after retries.
         """
-        r = self._cam.RetrieveResult(
-            self.timeout_ms, pylon.TimeoutHandling_Return
-        )
-        if r is None or not r.GrabSucceeded():
-            if r:
+        for attempt in range(3):
+            r = self._cam.RetrieveResult(
+                self.timeout_ms, pylon.TimeoutHandling_Return
+            )
+            if r is None:
+                print(f"[BaslerCamera] grab attempt {attempt+1}: timeout (r is None)")
+                continue
+            if not r.GrabSucceeded():
+                print(f"[BaslerCamera] grab attempt {attempt+1}: GrabSucceeded=False, "
+                      f"ErrorCode={r.ErrorCode}, ErrorDescription={r.ErrorDescription}")
                 r.Release()
+                continue
+            # success — break out of retry loop
+            break
+        else:
             return None
 
         img = r.Array.copy()
