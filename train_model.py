@@ -48,8 +48,10 @@ p.add_argument('--pretrained_path', type=str, default='',
                help='Path of pretrained checkpoint to start from.')
 p.add_argument('--model_path', type=str, default='./models',
                help='Directory for saving checkpoints.')
-p.add_argument('--phase_path', type=str, default='./precomputed_phases',
-               help='Directory for pre-calculated phases.')
+p.add_argument('--phase_path', type=str, default='./phases/test',
+               help='Directory for pre-calculated phases (flat or with channel subdir).')
+p.add_argument('--data_path', type=str, default='./data/test',
+               help='Directory containing target images.')
 p.add_argument('--calibration_path', type=str, default='./calibration',
                help='Directory where calibration phases are stored.')
 p.add_argument('--lr_model', type=float, default=3e-3,
@@ -142,8 +144,13 @@ num_iters_phase_update = 1
 # ---------------------------------------------------------------------------
 model_path = opt.model_path
 utils.cond_mkdir(model_path)
-phase_path = "./phases/test"
-data_path  = './data/test'
+phase_path = opt.phase_path
+data_path  = opt.data_path
+
+# Phase files may live directly in phase_path (flat layout) or in a
+# channel-named subdirectory (chan_str layout).  Detect which.
+_chan_subdir = os.path.join(phase_path, chan_str)
+_use_chan_subdir = os.path.isdir(_chan_subdir)
 
 # ---------------------------------------------------------------------------
 # Hardware setup (SLM + Basler camera)
@@ -232,13 +239,10 @@ for e in range(opt.num_epochs):
         # ── Load pre-computed phases ─────────────────────────────────────────
         slm_phases = []
         for k, idx in enumerate(idxs):
-            phase_filename = os.path.join(phase_path, f'{chan_str}', f'{idx}.png')
-#        for k, idx in enumerate(idxs):
-#            if e > 0:
-#                phase_filename = os.path.join(phase_path, f'{chan_str}', f'{idx}.png')
-#            else:
-#                phase_filename = os.path.join(phase_path, f'{chan_str}',
-#                                              f'{idx}_{channel}', 'phasemaps_1000.png')
+            if _use_chan_subdir:
+                phase_filename = os.path.join(phase_path, chan_str, f'{idx}.png')
+            else:
+                phase_filename = os.path.join(phase_path, f'{idx}.png')
             slm_phase = skimage.io.imread(phase_filename) / np.iinfo(np.uint8).max
             slm_phase = torch.tensor((1 - slm_phase) * 2 * np.pi - np.pi,
                                      dtype=dtype).reshape(1, 1, *slm_res).to(device)
@@ -269,15 +273,17 @@ for e in range(opt.num_epochs):
             optimizer_phase.step()
             optimizer_phase_scale.step()
 
-        # Write updated phases back to the channel sub-directory so they are
-        # picked up correctly on the next load (same path used when reading).
+        # Write updated phases back to the same directory they were read from.
         with torch.no_grad():
-            chan_dir = os.path.join(phase_path, chan_str)
-            utils.cond_mkdir(chan_dir)
+            if _use_chan_subdir:
+                write_dir = os.path.join(phase_path, chan_str)
+            else:
+                write_dir = phase_path
+            utils.cond_mkdir(write_dir)
             for k, idx in enumerate(idxs):
                 phase_out_8bit = utils.phasemap_8bit(
                     slm_phases[k, np.newaxis, ...].cpu().detach(), inverted=True)
-                cv2.imwrite(os.path.join(chan_dir, f'{idx}.png'), phase_out_8bit)
+                cv2.imwrite(os.path.join(write_dir, f'{idx}.png'), phase_out_8bit)
 
         # Quantise phases to 8-bit as displayed on SLM
         slm_phases = utils.quantized_phase(slm_phases)
